@@ -28,3 +28,10 @@ target_include_directories(yinfer_core PUBLIC runtime)
 # 命令行工具：info / run / verify
 add_executable(yinfer tools/yinfer.cpp tools/reference.cpp)
 target_link_libraries(yinfer PRIVATE yinfer_core)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(test_memory_plan tests/test_memory_plan.cpp)
+  target_link_libraries(test_memory_plan PRIVATE yinfer_core)
+  add_test(NAME memory_plan COMMAND test_memory_plan)
+endif()

@@ -29,7 +29,8 @@ void usage() {
         "  chained   节点吃前面节点自己算出的结果，误差一路累积，量的是端到端误差\n"
         "还没实现的算子直接用参考数据顶上（状态 REF），所以任何阶段都能把整张图走完\n"
         "--perturb N  执行完第 N 个节点后故意改坏它的输出，用来确认对拍工具真能抓到错\n"
-        "--brief      不打印 REF 行\n");
+        "--brief      不打印 REF 行\n"
+        "--memory naive|reuse  验证时选择内存规划，默认 reuse（不是原地算子）\n");
 }
 
 double mib(size_t bytes) { return bytes / 1024.0 / 1024.0; }
@@ -65,6 +66,8 @@ int cmd_info(const std::string& model_dir) {
                 m.tensors.size(), n_const, mib(m.weights.bytes()), n_act, mib(ex.arena_bytes()));
     for (int i : m.inputs) std::printf("  输入 %-16s %s\n", m.tensors[i].shape_str().c_str(), m.tensors[i].name.c_str());
     for (int i : m.outputs) std::printf("  输出 %-16s %s\n", m.tensors[i].shape_str().c_str(), m.tensors[i].name.c_str());
+    std::printf("  激活规划：reuse %.2f MiB；naive 对照 %.2f MiB（不含权重、参考数据与进程其他内存）\n",
+                mib(ex.arena_bytes()), mib(plan_naive(m).total));
     std::printf("  卷积计算量 %.2f GFLOP\n", flops / 1e9);
     print_missing(ex);
     return 0;
@@ -103,6 +106,7 @@ struct VerifyOptions {
     double tol = 1e-4;          // 相对误差 = max|d| / max|参考值| 的上限
     long perturb = -1;
     bool brief = false;
+    bool reuse = true;
 };
 
 // 把输出里绝对值最大的元素加上它自己的 1%：故意制造一个错误，确认对拍工具真的抓得到（验证"验证器"本身）
@@ -119,7 +123,7 @@ void perturb(Tensor& t) {
 
 int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const VerifyOptions& opt) {
     Model m = Model::load(model_dir);
-    Executor ex(m);
+    Executor ex(m, opt.reuse);
     const Reference ref = Reference::load(ref_dir);
     for (const Tensor& t : m.tensors) {                     // 每个激活都要有参考数据，并且形状一致
         if (t.is_const) continue;
@@ -132,6 +136,7 @@ int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const V
         std::memcpy(t.data, ref.at(t.name).data, t.bytes());
     };
 
+    std::printf("激活内存：%s %.2f MiB\n", opt.reuse ? "reuse" : "naive", mib(ex.arena_bytes()));
     std::printf("逐层对拍：%s，通过标准 rel = max|d| / max|ref| <= %.0e\n",
                 opt.isolated ? "isolated 模式（每层输入都用参考数据）" : "chained 模式（误差逐层累积）", opt.tol);
     std::printf("%4s  %-15s %-14s %-6s %8s %10s %10s %12s  %s\n", "idx", "op", "shape", "status", "exact", "max|d|", "rel", "cos", "tensor");
@@ -211,6 +216,10 @@ int main(int argc, char** argv) {
                     const std::string v = value();
                     YI_CHECK(v == "isolated" || v == "chained", "--mode 只能是 isolated 或 chained");
                     opt.isolated = v == "isolated";
+                } else if (a == "--memory") {
+                    const std::string v = value();
+                    YI_CHECK(v == "naive" || v == "reuse", "--memory 只能是 naive 或 reuse");
+                    opt.reuse = v == "reuse";
                 } else if (a == "--tol") {
                     opt.tol = std::stod(value());
                 } else if (a == "--perturb") {

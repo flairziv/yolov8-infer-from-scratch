@@ -179,12 +179,56 @@ void upsample_nearest(const Node& node, std::vector<Tensor>& t) {
     }
 }
 
+// 直接卷积（不翻转卷积核）：group=1、dilation=1、权重 OIHW，逐输出点累加。
+// 这是正确性基线，不使用 im2col、手写 SIMD、线程或额外工作区。
+void conv(const Node& node, std::vector<Tensor>& t) {
+    YI_CHECK(node.inputs.size() == 3 && node.outputs.size() == 1, "Conv 需要输入、权重、偏置以及一个输出");
+    const Tensor& x = t[node.inputs[0]];
+    const Tensor& weight = t[node.inputs[1]];
+    const Tensor& bias = t[node.inputs[2]];
+    Tensor& y = t[node.outputs[0]];
+    const auto win = window_for(node, x, y);
+    YI_CHECK(weight.is_const && bias.is_const, "Conv 权重与偏置必须是常量");
+    YI_CHECK(weight.shape.size() == 4, "Conv 权重必须是四维 OIHW");
+    const int64_t Cin = x.shape[1], Cout = y.shape[1];
+    const int64_t Kh = win.kernel[0], Kw = win.kernel[1];
+    YI_CHECK(weight.shape[0] == Cout && weight.shape[1] == Cin &&
+                 weight.shape[2] == Kh && weight.shape[3] == Kw, "Conv 权重与输入输出通道或窗口不匹配");
+    YI_CHECK(bias.shape.size() == 1 && bias.shape[0] == Cout, "Conv 偏置长度必须等于输出通道数");
+    const int64_t H = x.shape[2], W = x.shape[3], Ho = y.shape[2], Wo = y.shape[3];
+    for (int64_t n = 0; n < x.shape[0]; ++n) {
+        for (int64_t co = 0; co < Cout; ++co) {
+            float* yp = y.data + (n * Cout + co) * Ho * Wo;
+            for (int64_t oh = 0; oh < Ho; ++oh) {
+                for (int64_t ow = 0; ow < Wo; ++ow) {
+                    float sum = 0.0f;
+                    for (int64_t ci = 0; ci < Cin; ++ci) {
+                        const float* xp = x.data + (n * Cin + ci) * H * W;
+                        const float* wp = weight.data + (co * Cin + ci) * Kh * Kw;
+                        for (int64_t kh = 0; kh < Kh; ++kh) {
+                            const int64_t ih = oh * win.stride[0] + kh - win.pad[0];
+                            if (ih < 0 || ih >= H) continue;
+                            for (int64_t kw = 0; kw < Kw; ++kw) {
+                                const int64_t iw = ow * win.stride[1] + kw - win.pad[1];
+                                if (iw < 0 || iw >= W) continue;
+                                sum += xp[ih * W + iw] * wp[kh * Kw + kw];
+                            }
+                        }
+                    }
+                    yp[oh * Wo + ow] = sum + bias.data[co];
+                }
+            }
+        }
+    }
+}
+
 struct Entry {
     const char* op;
     KernelFn fn;
 };
 
 const Entry kKernels[] = {
+    {"Conv", conv},
     {"Concat", concat},
     {"Split", split},
     {"Add", add},

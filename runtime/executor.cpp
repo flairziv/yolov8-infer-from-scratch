@@ -7,8 +7,8 @@
 
 namespace yi {
 
-Executor::Executor(Model& model) : model_(model) {
-    const MemoryPlan plan = plan_naive(model_);
+Executor::Executor(Model& model, bool reuse) : model_(model) {
+    const MemoryPlan plan = reuse ? plan_reuse(model_) : plan_naive(model_);
     arena_ = AlignedBuffer(plan.total);
     for (size_t i = 0; i < model_.tensors.size(); ++i) {
         Tensor& t = model_.tensors[i];

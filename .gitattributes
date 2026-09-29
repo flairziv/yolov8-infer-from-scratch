@@ -1,0 +1,5 @@
+# 在 Windows 上编辑、在 WSL 里运行：统一用 LF 换行，否则 shell 脚本会报 $'\r': command not found
+* text=auto eol=lf
+*.jpg binary
+*.png binary
+*.bin binary

@@ -1,0 +1,17 @@
+# 构建目录
+build*/
+
+# 生成物：权重、ONNX、导出的模型文件、参考数据。
+# 体积大，而且 YOLOv8 权重是 Ultralytics 的 AGPL-3.0 许可，不随仓库分发，由 frontend/ 的脚本现场生成
+artifacts/
+*.pt
+*.onnx
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/

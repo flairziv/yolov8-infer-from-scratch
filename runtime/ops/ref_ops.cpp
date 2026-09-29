@@ -77,6 +77,20 @@ void add(const Node& node, std::vector<Tensor>& t) {
     for (int64_t i = 0; i < n; ++i) y.data[i] = a.data[i] + b.data[i];
 }
 
+// SiLU(x) = x * sigmoid(x)。负半轴用 exp(x)，避免 exp(-x) 上溢。
+void silu(const Node& node, std::vector<Tensor>& t) {
+    YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "SiLU 需要一个输入和一个输出");
+    const Tensor& x = t[node.inputs[0]];
+    Tensor& y = t[node.outputs[0]];
+    YI_CHECK(x.shape == y.shape, "SiLU 输入输出形状必须一致");
+    for (int64_t i = 0; i < x.numel(); ++i) {
+        const float v = x.data[i];
+        const float e = std::exp(-std::fabs(v));
+        const float sigmoid = v >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e);
+        y.data[i] = v * sigmoid;
+    }
+}
+
 // 空间算子只接受连续的四维 NCHW；检查在任何输出写入之前完成。
 void check_nchw(const Tensor& t) {
     YI_CHECK(t.shape.size() == 4, t.name << " 必须是四维 NCHW");
@@ -174,6 +188,7 @@ const Entry kKernels[] = {
     {"Concat", concat},
     {"Split", split},
     {"Add", add},
+    {"SiLU", silu},
     {"MaxPool", maxpool},
     {"UpsampleNearest", upsample_nearest},
 };

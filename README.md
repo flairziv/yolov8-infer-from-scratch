@@ -2,14 +2,14 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 1 的算子部分**：七类 CPU 标量算子均已实现，可以独立执行 152 节点子图并产生六路检测头张量。两张测试图片逐层对拍均为 `REF=0`。生命周期内存复用尚未实现，激活仍独占空间；SSE/AVX2、CUDA、DFL 解码和 NMS 属于后续计划，目前还不能输出最终检测框。
+**当前完成阶段 1**：七类 CPU 标量算子与生命周期内存复用均已实现，可以独立执行 152 节点子图并产生六路检测头张量。默认 `reuse` 激活 arena 为 17.19 MiB，保留 `naive` 对照（158.81 MiB）；两张测试图片的六路输出在两种内存规划之间逐位一致，逐层 ORT 对拍均为 `REF=0`。SSE/AVX2、CUDA、DFL 解码和 NMS 属于后续计划，目前还不能输出最终检测框。
 
 ## 进度
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
-| 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 算子完成，内存复用待实现 |
+| 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE 重写逐元素算子、池化、SiLU 和卷积微内核 | 待实现 |
 | 3 | 卷积覆盖全部形状，偏置与 SiLU 融进卷积，多线程 | 待实现 |
 | 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
@@ -140,7 +140,7 @@ isolated 中，Concat/Split/Add 的 35 个输出，加上 MaxPool/UpsampleNeares
 - bus.jpg 的 ASan/UBSan chained 验证通过；真实子图独立执行成功。
 - `--mode chained --perturb 10` 故意破坏 bus.jpg 中一个节点的输出，得到 88 个 FAIL、退出码 1，确认错误可以被检测。
 - 只说明这些测试样例的数值一致性，不等于检测 mAP 或任意模型精度认证。
-- 卷积是逐输出直接累加的正确性基线，未做 im2col、手写 SIMD、多线程或内存复用。
+- 卷积是逐输出直接累加的正确性基线，未做 im2col、手写 SIMD 或多线程；内存复用不改变算子计算代码。
 
 第二张图片复现方式：
 
@@ -149,6 +149,42 @@ IMAGE=$(python3 -c 'from pathlib import Path; import ultralytics; print(Path(ult
 python3 frontend/make_reference.py --image "$IMAGE" --out artifacts/stage1-zidane
 ./build/yinfer verify artifacts/model artifacts/stage1-zidane --mode isolated
 ./build/yinfer verify artifacts/model artifacts/stage1-zidane --mode chained
+```
+
+### 阶段 1.4：生命周期内存复用
+
+`Executor(model, true)` 默认使用复用规划，传 `false` 保留独占空间对照。`yinfer verify` 支持 `--memory naive|reuse`，默认 reuse；`info` 同时列出两种规划大小，`run` 使用默认复用规划。
+
+| 规划 | 激活 arena 字节数 | MiB |
+|---|---:|---:|
+| naive | 166528000 | 158.81 |
+| reuse | 18022400 | 17.19 |
+
+激活 arena 减少约 89.2%。这不是进程 RSS 或整个推理链路的内存降幅：权重、参考数据、解析结构和运行时开销不在此数值内，也不由此宣称性能加速。
+
+策略与边界：
+
+- 按节点顺序计算每个激活的闭区间生命周期；只有 `旧张量最后使用节点 < 新张量生产节点` 才能复用。
+- 同一节点的输入、输出以及多个输出互不覆盖；不做原地算子或 Split 视图别名。
+- 图输入和图输出保留到执行结束：支持只 `set_input` 一次后连续 `run`，早期图输出不会被后续节点覆盖。
+- 选择最小的足够大空闲块，拆分剩余空间，并合并相邻空闲块；所有偏移保持 64 字节对齐。这是启发式方案，不保证全局最优。
+- 独立检查范围、对齐和活跃区间重叠；ASan 不一定能发现同一 arena 内部的数据覆盖。
+- 只适用于顺序执行、连续张量和无视图别名的当前模型契约。中间张量过了生命周期后不再保证保留，逐层对拍必须在执行当前节点后立即进行。
+
+验证：7 组 C++ 内存测试、13 个 Python 算子/验证器测试在 Release 和 ASan/UBSan 构建下通过。两张图片分别执行 naive/reuse，六路最终输出 `memcmp` 完全一致；两图 × 两种输入模式 × 两种内存规划的 ORT 对拍都通过，结果与上表阶段 1 数值一致。bus.jpg 的 sanitizer 真实模型对照和 chained 验证通过；错误注入仍返回 1。
+
+```bash
+bash scripts/build.sh
+ctest --test-dir build --output-on-failure
+./build/yinfer info artifacts/model
+./build/yinfer verify artifacts/model artifacts/ref --mode chained --memory naive
+./build/yinfer verify artifacts/model artifacts/ref --mode chained --memory reuse
+# 直接比较自写算子在两种规划下的六路输出，而不是只比较各自对 ORT 的容差
+./build/test_memory_plan artifacts/model artifacts/ref/input.bin
+./build/test_memory_plan artifacts/model artifacts/stage1-zidane/input.bin
+# 内存测试的 sanitizer 版本
+BUILD_DIR=build-asan bash scripts/build.sh -DYI_SANITIZE=ON
+ctest --test-dir build-asan --output-on-failure
 ```
 
 ### 阶段 0：保留的历史记录

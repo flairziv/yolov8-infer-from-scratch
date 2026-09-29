@@ -1,7 +1,8 @@
-// ref_ops.cpp —— 标量参考实现
-//   阶段 0 只放三个不做乘加的算子：Concat、Split、Add。它们用来验证整条管线 ——
-//   结果必须和 ORT 逐位相同，对不上就一定是加载、形状或偏移错了，而不是浮点误差。
+// ref_ops.cpp —— CPU 标量参考实现；先保证语义正确，再引入 SIMD、分块和多线程。
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "ops.h"
 
@@ -76,6 +77,94 @@ void add(const Node& node, std::vector<Tensor>& t) {
     for (int64_t i = 0; i < n; ++i) y.data[i] = a.data[i] + b.data[i];
 }
 
+// 空间算子只接受连续的四维 NCHW；检查在任何输出写入之前完成。
+void check_nchw(const Tensor& t) {
+    YI_CHECK(t.shape.size() == 4, t.name << " 必须是四维 NCHW");
+    for (int64_t d : t.shape) YI_CHECK(d > 0, t.name << " 的维度必须为正数");
+}
+
+struct Window2D {
+    std::vector<int64_t> kernel, stride, pad;
+};
+
+// Conv / MaxPool 都用同一个滑动窗口尺寸公式。pad 顺序：上、左、下、右。
+Window2D window_for(const Node& node, const Tensor& x, const Tensor& y) {
+    check_nchw(x);
+    check_nchw(y);
+    Window2D w{node.attrs.ints("kernel"), node.attrs.ints("stride"), node.attrs.ints("pad")};
+    YI_CHECK(w.kernel.size() == 2 && w.stride.size() == 2 && w.pad.size() == 4,
+             node.name << " 的 kernel/stride/pad 长度应为 2/2/4");
+    for (int64_t k : w.kernel) YI_CHECK(k > 0, node.name << " 的窗口必须为正数");
+    for (int64_t s : w.stride) YI_CHECK(s > 0, node.name << " 的步长必须为正数");
+    for (int64_t p : w.pad) YI_CHECK(p >= 0, node.name << " 的填充不能为负数");
+    for (int d = 0; d < 2; ++d) {
+        const int64_t span = x.shape[d + 2] + w.pad[d] + w.pad[d + 2] - w.kernel[d];
+        // 先拒绝负数，避免 C++ 负整数除法向零截断，与 floor 公式不一致。
+        YI_CHECK(span >= 0, node.name << " 的窗口大于填充后的输入");
+        YI_CHECK(y.shape[d + 2] == span / w.stride[d] + 1, node.name << " 的输出空间尺寸错误");
+    }
+    YI_CHECK(x.shape[0] == y.shape[0], node.name << " 的输入输出 batch 不一致");
+    return w;
+}
+
+void maxpool(const Node& node, std::vector<Tensor>& t) {
+    YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "MaxPool 需要一个输入和一个输出");
+    const Tensor& x = t[node.inputs[0]];
+    Tensor& y = t[node.outputs[0]];
+    const auto w = window_for(node, x, y);
+    YI_CHECK(x.shape[1] == y.shape[1], "MaxPool 不能改变通道数");
+    const int64_t H = x.shape[2], W = x.shape[3], Ho = y.shape[2], Wo = y.shape[3];
+    for (int64_t n = 0; n < x.shape[0]; ++n) {
+        for (int64_t c = 0; c < x.shape[1]; ++c) {
+            const float* xp = x.data + (n * x.shape[1] + c) * H * W;
+            float* yp = y.data + (n * y.shape[1] + c) * Ho * Wo;
+            for (int64_t oh = 0; oh < Ho; ++oh) {
+                for (int64_t ow = 0; ow < Wo; ++ow) {
+                    float best = -std::numeric_limits<float>::infinity();
+                    for (int64_t kh = 0; kh < w.kernel[0]; ++kh) {
+                        const int64_t ih = oh * w.stride[0] + kh - w.pad[0];
+                        if (ih < 0 || ih >= H) continue;
+                        for (int64_t kw = 0; kw < w.kernel[1]; ++kw) {
+                            const int64_t iw = ow * w.stride[1] + kw - w.pad[1];
+                            if (iw < 0 || iw >= W) continue;
+                            const float v = xp[ih * W + iw];
+                            // 越界跳过，相当于补负无穷；不能补 0，否则全负窗口会算错。
+                            if (v > best || std::isnan(v)) best = v;
+                        }
+                    }
+                    yp[oh * Wo + ow] = best;
+                }
+            }
+        }
+    }
+}
+
+void upsample_nearest(const Node& node, std::vector<Tensor>& t) {
+    YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "UpsampleNearest 需要一个输入和一个输出");
+    const Tensor& x = t[node.inputs[0]];
+    Tensor& y = t[node.outputs[0]];
+    check_nchw(x);
+    check_nchw(y);
+    const auto scale = node.attrs.ints("scale");
+    YI_CHECK(scale.size() == 2 && scale[0] > 0 && scale[1] > 0, "上采样倍率必须是两个正整数");
+    YI_CHECK(x.shape[0] == y.shape[0] && x.shape[1] == y.shape[1], "上采样不能改变 batch 和通道数");
+    for (int d = 0; d < 2; ++d) {
+        YI_CHECK(scale[d] <= std::numeric_limits<int64_t>::max() / x.shape[d + 2], "上采样尺寸溢出");
+        YI_CHECK(y.shape[d + 2] == x.shape[d + 2] * scale[d], "上采样输出尺寸与倍率不一致");
+    }
+    const int64_t H = x.shape[2], W = x.shape[3], Ho = y.shape[2], Wo = y.shape[3];
+    for (int64_t n = 0; n < x.shape[0]; ++n) {
+        for (int64_t c = 0; c < x.shape[1]; ++c) {
+            const float* xp = x.data + (n * x.shape[1] + c) * H * W;
+            float* yp = y.data + (n * y.shape[1] + c) * Ho * Wo;
+            for (int64_t oh = 0; oh < Ho; ++oh)
+                for (int64_t ow = 0; ow < Wo; ++ow)
+                    // 前端保证 nearest + asymmetric + floor，可直接使用非负整数除法。
+                    yp[oh * Wo + ow] = xp[(oh / scale[0]) * W + ow / scale[1]];
+        }
+    }
+}
+
 struct Entry {
     const char* op;
     KernelFn fn;
@@ -85,6 +174,8 @@ const Entry kKernels[] = {
     {"Concat", concat},
     {"Split", split},
     {"Add", add},
+    {"MaxPool", maxpool},
+    {"UpsampleNearest", upsample_nearest},
 };
 
 }  // namespace

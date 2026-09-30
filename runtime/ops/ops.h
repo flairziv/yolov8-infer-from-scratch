@@ -1,16 +1,24 @@
-// ops.h —— 算子注册表：算子名 → 实现函数
+// ops.h —— 统一算子接口、执行器所有的临时工作区，以及后端分派。
 #pragma once
 #include <string>
 #include <vector>
 
+#include "backend.h"
 #include "model.h"
 
 namespace yi {
 
-// 所有算子函数的统一签名：从 node.inputs 指向的张量读，往 node.outputs 指向的张量写。
-// 输出的内存由执行器事先分配好，算子只负责填数，不分配内存
-using KernelFn = void (*)(const Node& node, std::vector<Tensor>& tensors);
+// 只借用执行器持有的内存，不负责分配/释放。各顺序执行节点复用同一块临时空间。
+struct Workspace {
+    float* data = nullptr;
+    size_t bytes = 0;
+};
 
-KernelFn find_kernel(const std::string& op);   // 还没实现的算子返回 nullptr
+using KernelFn = void (*)(const Node& node, std::vector<Tensor>& tensors, Workspace& workspace);
+
+KernelFn find_kernel(const std::string& op);  // 标量参考实现；未实现返回 nullptr
+struct KernelSelection { KernelFn fn = nullptr; bool simd = false; };
+KernelSelection select_kernel(const Node& node, const std::vector<Tensor>& tensors, Backend backend);
+size_t kernel_workspace_bytes(const Node& node, const std::vector<Tensor>& tensors, Backend backend);
 
 }  // namespace yi

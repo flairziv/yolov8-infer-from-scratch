@@ -28,7 +28,7 @@ AxisView view_at(const Tensor& t, int64_t axis) {
 }
 
 // Concat：输出的每个块 = 各输入对应的块依次首尾相接
-void concat(const Node& node, std::vector<Tensor>& t) {
+void concat(const Node& node, std::vector<Tensor>& t, Workspace&) {
     Tensor& y = t[node.outputs[0]];
     const int64_t axis = node.attrs.i("axis");
     const AxisView yv = view_at(y, axis);
@@ -47,7 +47,7 @@ void concat(const Node& node, std::vector<Tensor>& t) {
 }
 
 // Split：Concat 反过来，从输入的每个块里依次切出各输出的那一段
-void split(const Node& node, std::vector<Tensor>& t) {
+void split(const Node& node, std::vector<Tensor>& t, Workspace&) {
     const Tensor& x = t[node.inputs[0]];
     const int64_t axis = node.attrs.i("axis");
     const auto sizes = node.attrs.ints("sizes");
@@ -68,7 +68,7 @@ void split(const Node& node, std::vector<Tensor>& t) {
 }
 
 // Add：逐元素相加。只支持两个输入形状完全相同（YOLOv8 的残差连接正好是这样）
-void add(const Node& node, std::vector<Tensor>& t) {
+void add(const Node& node, std::vector<Tensor>& t, Workspace&) {
     const Tensor& a = t[node.inputs[0]];
     const Tensor& b = t[node.inputs[1]];
     Tensor& y = t[node.outputs[0]];
@@ -78,7 +78,7 @@ void add(const Node& node, std::vector<Tensor>& t) {
 }
 
 // SiLU(x) = x * sigmoid(x)。负半轴用 exp(x)，避免 exp(-x) 上溢。
-void silu(const Node& node, std::vector<Tensor>& t) {
+void silu(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "SiLU 需要一个输入和一个输出");
     const Tensor& x = t[node.inputs[0]];
     Tensor& y = t[node.outputs[0]];
@@ -121,7 +121,7 @@ Window2D window_for(const Node& node, const Tensor& x, const Tensor& y) {
     return w;
 }
 
-void maxpool(const Node& node, std::vector<Tensor>& t) {
+void maxpool(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "MaxPool 需要一个输入和一个输出");
     const Tensor& x = t[node.inputs[0]];
     Tensor& y = t[node.outputs[0]];
@@ -153,7 +153,7 @@ void maxpool(const Node& node, std::vector<Tensor>& t) {
     }
 }
 
-void upsample_nearest(const Node& node, std::vector<Tensor>& t) {
+void upsample_nearest(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "UpsampleNearest 需要一个输入和一个输出");
     const Tensor& x = t[node.inputs[0]];
     Tensor& y = t[node.outputs[0]];
@@ -181,7 +181,7 @@ void upsample_nearest(const Node& node, std::vector<Tensor>& t) {
 
 // 直接卷积（不翻转卷积核）：group=1、dilation=1、权重 OIHW，逐输出点累加。
 // 这是正确性基线，不使用 im2col、手写 SIMD、线程或额外工作区。
-void conv(const Node& node, std::vector<Tensor>& t) {
+void conv(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 3 && node.outputs.size() == 1, "Conv 需要输入、权重、偏置以及一个输出");
     const Tensor& x = t[node.inputs[0]];
     const Tensor& weight = t[node.inputs[1]];

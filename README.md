@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 1**：七类 CPU 标量算子与生命周期内存复用均已实现，可以独立执行 152 节点子图并产生六路检测头张量。默认 `reuse` 激活 arena 为 17.19 MiB，保留 `naive` 对照（158.81 MiB）；两张测试图片的六路输出在两种内存规划之间逐位一致，逐层 ORT 对拍均为 `REF=0`。SSE/AVX2、CUDA、DFL 解码和 NMS 属于后续计划，目前还不能输出最终检测框。
+**当前完成阶段 2**：在七类标量算子、生命周期内存复用的基础上，加入可显式选择的 SSE2 与 AVX2/FMA 后端。Add、SiLU、MaxPool 和卷积有 SIMD 实现；卷积采用 im2col、面板打包与寄存器微内核，临时工作区由执行器一次分配并复用。默认仍为 `scalar`，保留正确性基线。可以输出六路检测头张量；多线程、算子融合、CUDA、DFL 解码和 NMS 尚未实现，不能输出最终检测框。
 
 ## 进度
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
-| 2 | SSE 重写逐元素算子、池化、SiLU 和卷积微内核 | 待实现 |
+| 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
 | 3 | 卷积覆盖全部形状，偏置与 SiLU 融进卷积，多线程 | 待实现 |
 | 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
 | 5 | 可选：INT8 卷积 / ARM NEON 移植 | 待实现 |
@@ -119,6 +119,84 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
 
+### 阶段 2：SIMD 后端、卷积微内核与工作区
+
+```bash
+bash scripts/build.sh
+./build/yinfer backends
+./build/yinfer info artifacts/model --backend avx2
+./build/yinfer verify artifacts/model artifacts/ref --backend sse --mode isolated
+./build/yinfer verify artifacts/model artifacts/ref --backend avx2 --mode chained
+./build/yinfer run artifacts/model artifacts/ref/input.bin --backend avx2
+# 可选：导出六路原始张量，不包含 DFL/NMS；文件与时间日志分开
+./build/yinfer run artifacts/model artifacts/ref/input.bin --backend avx2 --dump-dir artifacts/my-output
+ctest --test-dir build --output-on-failure
+python3 -m unittest discover -s tests -v
+```
+
+`Executor(model, reuse, Backend::AVX2)` 保留旧构造调用的兼容性，默认 `Backend::Scalar`。`info/run/verify` 可显式选择 `--backend scalar|sse|avx2`；`run/verify` 可选择 `--memory naive|reuse`。dump 目录中为 `output0.bin` 等小端 FP32 张量，以及描述文件名、张量名和形状的 `outputs.txt`。
+
+实现范围：
+
+- SSE 后端实际要求 SSE2；AVX2 后端同时要求 FMA。启动时检查 CPU/OS 能力，不支持时明确报错，不在能力检查前执行 AVX 指令。
+- Add 使用非对齐向量读写加标量尾部。MaxPool 的连续完整窗口组向量化，边缘标量处理，strideW 不为 1 或无完整向量组时整节点回退。
+- SiLU 自写 7 阶 Taylor/Horner exp 近似，范围缩减到 `[-ln2/2, ln2/2]`；完整向量组中 `|x|<=80` 时走 SIMD，极值、非有限数组和尾部走稳定标量公式。
+- Conv 将单个 batch 展开为 `K×N`，再打包 `K×NR` 面板，复用于所有输出通道行。SSE 微内核 `MR=4, NR=8`；AVX2/FMA 为 `MR=4, NR=16`，均有 8 个向量累加器。M/N 尾块显式处理，不假设通道数或输出尺寸整除分块。
+- Concat、Split、UpsampleNearest 共享既有实现，不声称所有节点都实现了 SIMD。当前真实模型选择 129 个 SIMD 节点、23 个共享/回退节点；节点内部仍可能处理标量边界。回退是真实计算，不是 REF 占位。
+- 工作区在 Executor 初始化时按所有卷积的最大需求分配：`max(align64(K*N*4) + K*NR*4)`，不同层、不同 batch 共享；执行卷积时不申请大型数值缓冲。
+
+| 后端 | 激活 arena | 额外 workspace 字节数 | 额外 workspace MiB |
+|---|---:|---:|---:|
+| scalar | 17.19 MiB | 0 | 0 |
+| sse | 17.19 MiB | 18455040 | 17.60 |
+| avx2 | 17.19 MiB | 18478080 | 17.62 |
+
+不能只报 arena 并忽略 workspace：显式展开是本阶段以临时空间换取规则访存的取舍。上表仍不含权重和进程其他内存。
+
+#### 数值与边界验证
+
+以下均为 `FAIL=0、REF=0`，沿用全图 `rel<=1e-4`，未放宽阈值：
+
+| 图片 | 后端 | isolated 最大 rel | chained 最大 rel |
+|---|---|---:|---:|
+| bus.jpg | sse | 1.554e-6 | 6.252e-6 |
+| zidane.jpg | sse | 1.897e-6 | 1.565e-5 |
+| bus.jpg | avx2 | 1.484e-6 | 4.376e-6 |
+| zidane.jpg | avx2 | 1.644e-6 | 1.403e-5 |
+
+- 43 个 Python 测试、2 个 CTest 目标在 Release 和 ASan/UBSan 构建下通过。SIMD 后端不可用时明确跳过对应测试类，不冒充通过。
+- 测试覆盖向量边界、全负池化、非正方形、多 batch、卷积 M/N/K 尾部、错误属性、重复执行与输入更换。
+- 两张图片、两种 SIMD 后端分别比较 naive/reuse 六路输出，逐位相同；两种后端的 bus.jpg sanitizer chained 检查通过。
+- SiLU 在固定 `[-18,18]` 区间的 20001 个点上，对 float64 数学参考四舍五入为 float32 后的最大距离为 3 ULP、99 分位为 2 ULP（scalar/SSE/AVX2 均如此）。这不是全实数域误差证明。另有密集点、范围缩减边界与极值的逐元素容差测试。
+- 禁用 SIMD 的构建可以运行 scalar，请求 avx2 返回错误码 3。这里只测试了编译开关路径，未声称在所有旧 CPU 上实测。
+- ISA 标志仅用于对应源文件；SSE 对象未出现 YMM/FMA，AVX2 对象包含 YMM/FMA 指令。公共模板采用内部链接，避免不同 ISA 实例被链接器合并。未启用 fast-math；MSVC 当前明确报不支持，推荐 WSL GCC/Clang。
+
+```bash
+python3 scripts/analyze_silu_accuracy.py --out artifacts/silu-new-run.json
+BUILD_DIR=build-asan bash scripts/build.sh -DYI_SANITIZE=ON
+ctest --test-dir build-asan --output-on-failure
+YINFER_BIN=build-asan/yinfer python3 -m unittest discover -s tests -v
+BUILD_DIR=build-scalar-only bash scripts/build.sh -DYI_ENABLE_X86_SIMD=OFF
+./build-scalar-only/yinfer backends
+```
+
+#### 同次交错计时
+
+CPU：i9-14900HX，WSL；同一模型、同一份 bus.jpg 预处理输入。每组 ABBA/BAAB 两块，每个后端 4 次采样，另有预热。每轮 fresh process，取 C++ `run` 内部计时，不包含进程启动、模型加载、输出打印和 dump；包含 im2col、打包与算子执行。
+
+| 配对组 | scalar 中位数 ms | 候选中位数 ms | 候选范围 ms | 中位数之比 |
+|---|---:|---:|---:|---:|
+| scalar / sse | 6819.99 | 457.66 | 423.12～461.55 | 14.90× |
+| scalar / avx2 | 6731.88 | 214.18 | 206.98～227.25 | 31.43× |
+
+这些是**完整后端变化**的同次对照，不是单条 SIMD 指令的加速比，也不是与 ORT/TensorRT 的比较。宿主机调度和频率未固定；loadavg 是观测，不是资源隔离门禁。每进程首次执行不等于常驻服务吞吐，不能与旧阶段的单次耗时相除，也不能泛化为其他设备性能。
+
+```bash
+python3 scripts/benchmark_backends.py --blocks 2 --out artifacts/stage2-benchmark.json
+```
+
+本次原始报告：`artifacts/stage2-benchmark.json`，SHA256：`e5f36ac2c52460a42bbb6c0f550f5dfe035dc70d84cec717565774ade5304dd2`。报告包含逐轮计时、正确性输出、二进制/输入/模型/权重哈希与运行时代码哈希。为保留旧记录，脚本拒绝覆盖已存在的报告；复跑应指定新文件名。大产物与原始日志不提交。
+
 ### 阶段 1：标量算子验证
 
 固定 batch=1、640×640 letterbox、FP32，沿用阈值 `rel <= 1e-4`，没有因新增算子而放宽。表格统计的是 160 个节点输出张量，不包含图输入。
@@ -197,7 +275,7 @@ ctest --test-dir build-asan --output-on-failure
 
 ```
 frontend/   Python 前端：导出、图优化、编译成运行时格式、生成参考数据
-runtime/    C++ 运行时：模型加载、内存规划、执行器、七类标量算子（ops/）
+runtime/    C++ 运行时：模型加载、内存规划、执行器、标量与 SSE/AVX2 算子
 tools/      命令行工具 yinfer 与参考数据读取
 tests/      小型 ONNX 算子对拍与验证器回归测试
 scripts/    prepare.sh（Python 前端）、build.sh（CMake 编译）

@@ -35,7 +35,9 @@ def reference(nodes, inputs, constants, output_shape):
 
 
 class RefOpsTest(unittest.TestCase):
-    def run_kernel(self, op, inputs, constants, attrs, expected, *, exact=False, rejected=False):
+    backend = os.environ.get("YINFER_BACKEND", "scalar")
+
+    def run_kernel(self, op, inputs, constants, attrs, expected, *, exact=False, rejected=False, memory="reuse", return_output=False):
         # 每个测试拥有独立模型、参考文件；不会污染用户的 artifacts。
         with tempfile.TemporaryDirectory(prefix="yinfer-op-") as tmp:
             root = Path(tmp)
@@ -62,7 +64,8 @@ class RefOpsTest(unittest.TestCase):
             (root / "ref.txt").write_text("\n".join(index) + "\n", encoding="utf-8")
             (root / "ref.bin").write_bytes(ref_blob)
             result = subprocess.run(
-                [str(BINARY), "verify", str(root), str(root), "--tol", "0" if exact else "1e-5", "--brief"],
+                [str(BINARY), "verify", str(root), str(root), "--tol", "0" if exact else "1e-5", "--brief",
+                 "--backend", self.backend, "--memory", memory],
                 capture_output=True, encoding="utf-8", timeout=60, check=False,
             )
             detail = result.stdout + result.stderr
@@ -76,6 +79,16 @@ class RefOpsTest(unittest.TestCase):
             self.assertEqual((matched + close, failed, ref), (1, 0, 0), detail)
             if exact:
                 self.assertEqual(matched, 1, detail)
+            if return_output:
+                self.assertEqual(len(inputs), 1, "dump 测试入口只接收单输入")
+                np.ascontiguousarray(next(iter(inputs.values())), dtype="<f4").tofile(root / "input.bin")
+                run = subprocess.run(
+                    [str(BINARY), "run", str(root), str(root / "input.bin"), "--backend", self.backend,
+                     "--dump-dir", str(root / "dump")],
+                    capture_output=True, encoding="utf-8", timeout=60, check=False,
+                )
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                return np.fromfile(root / "dump" / "output0.bin", dtype="<f4").reshape(expected.shape)
 
     def test_maxpool_negative_padding(self):
         x = -np.arange(1, 13, dtype=np.float32).reshape(1, 1, 3, 4)

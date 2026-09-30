@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -20,9 +22,10 @@ namespace {
 void usage() {
     std::printf(
         "用法:\n"
-        "  yinfer info   <模型目录>\n"
-        "  yinfer run    <模型目录> <input.bin>\n"
-        "  yinfer verify <模型目录> <参考数据目录> [--mode isolated|chained] [--tol 1e-4] [--perturb 节点号] [--brief]\n"
+        "  yinfer backends\n"
+        "  yinfer info   <模型目录> [--backend scalar|sse|avx2]\n"
+        "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2] [--memory naive|reuse] [--dump-dir 目录]\n"
+        "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2] [--mode isolated|chained] [--tol 1e-4] [--perturb 节点号] [--brief]\n"
         "\n"
         "verify 的两种模式:\n"
         "  isolated  每个节点都从参考数据取输入，只量这一层自己引入的误差（默认）\n"
@@ -46,9 +49,15 @@ void print_missing(const Executor& ex) {
     std::printf("\n");
 }
 
-int cmd_info(const std::string& model_dir) {
+void print_backend(const Executor& ex) {
+    std::printf("backend=%s workspace_bytes=%zu simd_nodes=%zu fallback_nodes=%zu\n",
+                backend_name(ex.backend()), ex.workspace_bytes(), ex.simd_nodes(), ex.fallback_nodes());
+}
+
+int cmd_info(const std::string& model_dir, Backend backend) {
     Model m = Model::load(model_dir);
-    Executor ex(m);
+    Executor ex(m, true, backend);
+    print_backend(ex);
     std::map<std::string, int> ops;
     for (const Node& n : m.nodes) ++ops[n.op];
     int n_const = 0, n_act = 0;
@@ -73,14 +82,34 @@ int cmd_info(const std::string& model_dir) {
     return 0;
 }
 
-int cmd_run(const std::string& model_dir, const std::string& input_path) {
+void dump_outputs(const Model& model, const std::string& dir) {
+    std::filesystem::create_directories(dir);
+    std::ofstream index(std::filesystem::path(dir) / "outputs.txt");
+    YI_CHECK(index, "无法创建输出索引 " << dir);
+    for (size_t i = 0; i < model.outputs.size(); ++i) {
+        const Tensor& t = model.tensors[model.outputs[i]];
+        const std::string file = "output" + std::to_string(i) + ".bin";
+        std::ofstream out(std::filesystem::path(dir) / file, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(t.data), static_cast<std::streamsize>(t.bytes()));
+        YI_CHECK(out, "输出文件写入失败 " << file);
+        index << file << " " << t.name << " ";
+        for (size_t d = 0; d < t.shape.size(); ++d) index << (d ? "," : "") << t.shape[d];
+        index << "\n";
+    }
+    YI_CHECK(index, "输出索引写入失败");
+}
+
+int cmd_run(const std::string& model_dir, const std::string& input_path,
+            Backend backend, bool reuse, const std::string& dump_dir) {
     Model m = Model::load(model_dir);
-    Executor ex(m);
+    Executor ex(m, reuse, backend);
+    print_backend(ex);
     if (!ex.missing_kernels().empty()) {
         std::printf("整图还跑不了（可以先用 yinfer verify 对拍已经实现的部分）\n");
         print_missing(ex);
         return 2;
     }
+    YI_CHECK(m.inputs.size() == 1, "run 命令当前只接受一个图输入");
     const Tensor& in = m.tensors[m.inputs[0]];
     const AlignedBuffer x = read_file(input_path, static_cast<int64_t>(in.bytes()));
     ex.set_input(0, x.as<float>());
@@ -97,7 +126,8 @@ int cmd_run(const std::string& model_dir, const std::string& input_path) {
         }
         std::printf("  %-14s min %9.4f  max %9.4f  mean %9.4f  %s\n", t.shape_str().c_str(), lo, hi, sum / t.numel(), t.name.c_str());
     }
-    std::printf("整图一次 %.2f ms（单次，含冷启动）\n", ms);
+    std::printf("整图一次 %.6f ms（单次，含冷启动）\n", ms);
+    if (!dump_dir.empty()) dump_outputs(m, dump_dir);
     return 0;
 }
 
@@ -107,6 +137,7 @@ struct VerifyOptions {
     long perturb = -1;
     bool brief = false;
     bool reuse = true;
+    Backend backend = Backend::Scalar;
 };
 
 // 把输出里绝对值最大的元素加上它自己的 1%：故意制造一个错误，确认对拍工具真的抓得到（验证"验证器"本身）
@@ -123,7 +154,8 @@ void perturb(Tensor& t) {
 
 int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const VerifyOptions& opt) {
     Model m = Model::load(model_dir);
-    Executor ex(m, opt.reuse);
+    Executor ex(m, opt.reuse, opt.backend);
+    print_backend(ex);
     const Reference ref = Reference::load(ref_dir);
     for (const Tensor& t : m.tensors) {                     // 每个激活都要有参考数据，并且形状一致
         if (t.is_const) continue;
@@ -197,13 +229,41 @@ int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const V
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "backends") {
+            for (Backend b : {Backend::Scalar, Backend::SSE, Backend::AVX2})
+                std::printf("%s %s\n", backend_name(b), backend_available(b) ? "available" : "unavailable");
+            return 0;
+        }
         if (argc < 3) {
             usage();
             return 1;
         }
         const std::string cmd = argv[1];
-        if (cmd == "info") return cmd_info(argv[2]);
-        if (cmd == "run" && argc == 4) return cmd_run(argv[2], argv[3]);
+        if (cmd == "info") {
+            Backend backend = Backend::Scalar;
+            for (int i = 3; i < argc; ++i) {
+                YI_CHECK(std::string(argv[i]) == "--backend" && i + 1 < argc, "info 只接受 --backend 参数");
+                backend = parse_backend(argv[++i]);
+            }
+            return cmd_info(argv[2], backend);
+        }
+        if (cmd == "run" && argc >= 4) {
+            Backend backend = Backend::Scalar;
+            bool reuse = true;
+            std::string dump_dir;
+            for (int i = 4; i < argc; ++i) {
+                const std::string a = argv[i];
+                YI_CHECK(i + 1 < argc, a << " 后面缺参数");
+                const std::string v = argv[++i];
+                if (a == "--backend") backend = parse_backend(v);
+                else if (a == "--dump-dir") dump_dir = v;
+                else if (a == "--memory") {
+                    YI_CHECK(v == "naive" || v == "reuse", "--memory 只能是 naive 或 reuse");
+                    reuse = v == "reuse";
+                } else YI_CHECK(false, "run 不认识参数 " << a);
+            }
+            return cmd_run(argv[2], argv[3], backend, reuse, dump_dir);
+        }
         if (cmd == "verify" && argc >= 4) {
             VerifyOptions opt;
             for (int i = 4; i < argc; ++i) {
@@ -212,7 +272,9 @@ int main(int argc, char** argv) {
                     YI_CHECK(i + 1 < argc, a << " 后面缺参数");
                     return argv[++i];
                 };
-                if (a == "--mode") {
+                if (a == "--backend") {
+                    opt.backend = parse_backend(value());
+                } else if (a == "--mode") {
                     const std::string v = value();
                     YI_CHECK(v == "isolated" || v == "chained", "--mode 只能是 isolated 或 chained");
                     opt.isolated = v == "isolated";

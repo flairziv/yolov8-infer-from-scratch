@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 2**：在七类标量算子、生命周期内存复用的基础上，加入可显式选择的 SSE2 与 AVX2/FMA 后端。Add、SiLU、MaxPool 和卷积有 SIMD 实现；卷积采用 im2col、面板打包与寄存器微内核，临时工作区由执行器一次分配并复用。默认仍为 `scalar`，保留正确性基线。可以输出六路检测头张量；多线程、算子融合、CUDA、DFL 解码和 NMS 尚未实现，不能输出最终检测框。
+**当前完成阶段 3.1–3.2**：卷积形状特化（1×1 直通，跳过 im2col）与收尾融合（Conv+SiLU 合成一个节点，激活在寄存器里直接算）。运行时子图从 152 节点减到 95 节点；AVX2 下 1×1 直通经同机交错对照约 1.50×，收尾融合在该机器上测不出差异（噪声范围内）。多线程、第二次内存优化（Split 视图等）和检测后处理（DFL/NMS）尚未实现，仍不能输出检测框。
 
 ## 进度
 
@@ -11,7 +11,7 @@
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
-| 3 | 卷积覆盖全部形状，偏置与 SiLU 融进卷积，多线程 | 待实现 |
+| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 3.1–3.2 完成，其余待做 |
 | 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
 | 5 | 可选：INT8 卷积 / ARM NEON 移植 | 待实现 |
 
@@ -20,7 +20,8 @@
 ```
 Python 前端 frontend/（离线跑一次）
   yolov8n.pt ──export_onnx.py──▶ yolov8n_bn.onnx（保留 BatchNormalization）
-             ──compile_model.py──▶ BN 折叠 → 常量折叠 → Slice 合成 Split → SiLU 融合 → 按运行时支持的算子切图
+             ──compile_model.py──▶ BN 折叠 → 常量折叠 → Slice 合成 Split → SiLU 融合 → Conv 收尾融合
+                                   → 按运行时支持的算子切图
                                  ▶ artifacts/model/model.txt + weights.bin
              ──make_reference.py──▶ artifacts/ref/input.bin + ref.bin + ref.txt
 
@@ -29,15 +30,15 @@ C++ 运行时 runtime/（不依赖推理库）
   tools/yinfer：info（模型概况）/ run（子图独立执行）/ verify（逐层对拍）
 ```
 
-前端导出的目标子图位于检测头 DFL 解码之前：152 个节点、7 种算子，输出 3 个尺度各一个框分支（64 通道）和类别分支（80 通道）。DFL 解码、坐标变换和 NMS 计划放在 C++ 后处理里；这种拆分思路也常用于 NPU 部署，但具体支持范围取决于工具链和版本。
+前端导出的目标子图位于检测头 DFL 解码之前：95 个节点、7 种算子，输出 3 个尺度各一个框分支（64 通道）和类别分支（80 通道）。57 个卷积带 `act=1`，SiLU 收尾已融进卷积。DFL 解码、坐标变换和 NMS 计划放在 C++ 后处理里；这种拆分思路也常用于 NPU 部署，但具体支持范围取决于工具链和版本。
 
 | 项目 | 值 |
 |---|---|
-| 节点 | Conv 63、SiLU 57、Concat 13、Split 8、Add 6、MaxPool 3、UpsampleNearest 2 |
+| 节点 | Conv 63（其中 57 个带 SiLU 收尾）、Concat 13、Split 8、Add 6、MaxPool 3、UpsampleNearest 2 |
 | 卷积形状 | 3×3 步长 1（32 个）、1×1 步长 1（24 个）、3×3 步长 2（7 个） |
 | 计算量 | 卷积 8.74 GFLOP（batch=1，乘和加各算一次） |
 | 权重 | 12.02 MiB（float32） |
-| 激活 | 161 个张量，不复用时共 158.8 MiB |
+| 激活 | 104 个张量，不复用时共 105.8 MiB（融合前为 161 个、158.8 MiB） |
 
 ## 快速开始（WSL / Linux）
 
@@ -79,7 +80,7 @@ YINFER_BIN=build-asan/yinfer python3 -m unittest discover -s tests -v
 `model.txt` 是文本，描述图；`weights.bin` 是所有常量首尾相接的 float32 小端数据，每个常量的起点按 64 字节对齐。思路和 ncnn 的 `.param` + `.bin` 一样：图结构人能直接读、能 diff，权重按内存布局直接读入。
 
 ```text
-format yolov8-infer 1
+format yolov8-infer 2
 weights weights.bin 12607552
 input images
 output /model.22/cv2.0/cv2.0.2/Conv_output_0
@@ -92,7 +93,7 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 
 | 运行时算子 | 属性 | 支持范围 |
 |---|---|---|
-| Conv | kernel、stride、pad（上 左 下 右） | FP32 NCHW，OIHW 常量权重和偏置，group=1、dilation=1；支持多 batch |
+| Conv | kernel、stride、pad（上 左 下 右）、act（可选） | FP32 NCHW，OIHW 常量权重和偏置，group=1、dilation=1；支持多 batch。`act=1` 表示 SiLU 收尾融合 |
 | SiLU | 无 | 同形状逐元素计算，指数参数取非正数，避免有限输入导致 exp 上溢 |
 | MaxPool | kernel、stride、pad | FP32 NCHW，单输出，ceil_mode=0、dilation=1；越界跳过，相当于补负无穷 |
 | UpsampleNearest | scale | nearest + asymmetric + floor，H/W 可用不同的正整数倍率 |
@@ -100,7 +101,7 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 | Split | axis、sizes | 连续行优先张量的切分 |
 | Add | 无 | 两个输入同形状，不支持广播 |
 
-前端负责确认 ONNX 属性属于上述支持范围，并将参数型常量输入降级成运行时属性。当前不是通用 ONNX 解释器，也不宣称能够安全读取任意不可信模型文件。
+前端负责确认 ONNX 属性属于上述支持范围，并将参数型常量输入降级成运行时属性。版本 2 增加了 Conv 的可选 `act` 属性；旧运行时读到版本 2 会明确拒绝（见 `runtime/model.cpp` 的版本检查），不会把 `act` 当未知属性忽略后静默算出没有激活的错误结果。当前不是通用 ONNX 解释器，也不宣称能够安全读取任意不可信模型文件。
 
 ## 逐层对拍
 
@@ -118,6 +119,57 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 未实现算子会标记 REF 并使用参考输出，**不能据此宣称整网通过**；误差传播也会被 REF 节点截断。
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
+
+### 阶段 3.1–3.2：1×1 直通与收尾融合
+
+两项优化，都可独立关闭做消融对照：
+
+- **Conv+SiLU 收尾融合**（`frontend/passes.py: fuse_conv_silu`）：Conv 的输出只被一个 SiLU 消费时，两个节点合成一个带 `act=1` 的卷积；激活在微内核收尾里对寄存器里的累加结果直接计算，中间张量不再写回内存再读一遍。57 个 SiLU 全部融合，运行时子图 152 → 95 节点，参考数据 158.8 → 105.8 MiB。`compile_model.py --no-fuse-act` 生成未融合对照模型。
+- **1×1 直通**（`runtime/ops/simd_common.h: im2col_identity`）：1×1、stride=1、无填充时展开矩阵就是输入本身，`col` 直接指向输入张量，跳过对整张输入的标量 im2col 拷贝。63 个卷积里 24 个命中。
+
+数值验证（`rel <= 1e-4` 沿用，未放宽；两张图片均 `FAIL=0、REF=0`）：
+
+| 图片 | 后端 | isolated EXACT/OK | isolated 最大 rel | chained 最大 rel |
+|---|---|---|---:|---:|
+| bus.jpg | scalar | 40 / 63 | 1.781e-6 | 5.166e-6 |
+| bus.jpg | sse | 40 / 63 | 1.781e-6 | 6.252e-6 |
+| bus.jpg | avx2 | 46 / 57 | 1.908e-6 | 4.376e-6 |
+| zidane.jpg | scalar | 40 / 63 | 1.999e-6 | 8.875e-6 |
+| zidane.jpg | sse | 40 / 63 | 1.999e-6 | 1.565e-5 |
+| zidane.jpg | avx2 | 46 / 57 | 1.999e-6 | 1.403e-5 |
+
+- 融合 vs 未融合：同一后端、同一输入的**六路最终输出逐位一致**（`memcmp`）；新增 `tests/test_fusion.py` 对每个可用后端做逐位对照。
+- 51 个 Python 测试、2 个 CTest 目标在 Release 和 ASan/UBSan 构建下通过。测试覆盖收尾激活的正负半轴、1×1 带 stride/填充（不能直通）的路径、非法 `act` 拒绝。
+- 融合后的模型可以直接用融合前的参考数据对拍（张量集合是原来的子集）；zidane 的验证就复用了阶段 1 生成的参考目录。
+
+同机交错消融（ABBA/BAAB，每变体 8 个采样，fresh process，C++ run 内部计时）：
+
+| 消融 | 后端 | 基线中位数 | 候选中位数 | 中位数之比 |
+|---|---|---:|---:|---:|
+| 1×1 直通（关 → 开） | avx2 | 205.78 ms | 136.88 ms | **1.50×** |
+| 收尾融合（未融合 → 融合） | avx2 | 125.79 ms | 127.32 ms | 0.99 |
+| 收尾融合（未融合 → 融合） | sse | 257.38 ms | 258.41 ms | 1.00 |
+
+- 1×1 直通的收益来自去掉了一个逐元素带边界判断的标量拷贝循环，不只是"省一次内存读"。
+- **收尾融合在这台机器上测不出差异**（两个后端的中位数之比都在 0.99～1.00，样本范围完全重叠）。合理解释：中间张量大多命中 L3（本机 36 MiB），省下的写回-读取流量有限；激活计算量与独立节点相同，只是换了位置。它在本机的价值是结构性的（模型更小、节点更少），省流量的收益在缓存更小的设备上才会显现。这不是"融合无用"，也不能拿它宣称加速。
+- 报告：`artifacts/stage3-bypass-avx2.json`（SHA256 `088f539118c4ca5ced9a6d757c48fd55410857c7a692e7683847ee258f07de06`）、`artifacts/stage3-fusion-avx2-blocks4.json`（`867b6a4a59161a6d5dd29eca4383ba4d2849f1b8f6d26afc43a576235d4dda19`）、`artifacts/stage3-fusion-sse-blocks4.json`（`2d2ebe83dd98ba711e7bd97754163a582a7f9da2296cb3b775fc8e3ac68fca7f`）。
+
+内存侧记录（供阶段 3.4 参考）：融合后同时存活峰值从 12.50 降到 10.94 MiB，但贪心复用规划出的 arena 从 17.19 略升到 18.75 MiB——分配序列改变后贪心装箱的碎片不同。**峰值是理论下界，arena 是启发式结果，两者不要混为一谈。**
+
+```bash
+# 融合模型（默认）与未融合对照
+PYTHON=python3 bash scripts/prepare.sh
+python3 frontend/compile_model.py --onnx artifacts/yolov8n_bn.onnx --opt artifacts/yolov8n_opt.onnx \
+    --out artifacts/model-nofuse --no-fuse-act
+python3 frontend/make_reference.py --model artifacts/model-nofuse --onnx artifacts/yolov8n_opt.onnx \
+    --orig artifacts/yolov8n_bn.onnx --out artifacts/ref-nofuse
+./build/yinfer info artifacts/model
+./build/yinfer verify artifacts/model artifacts/ref --mode chained --backend avx2
+# 消融：基线 = 未融合模型，候选 = 融合模型（ratio > 1 表示融合更快）
+python3 scripts/benchmark_backends.py --model artifacts/model-nofuse --ref artifacts/ref-nofuse \
+    --alt-model artifacts/model --alt-ref artifacts/ref --alt-label fused --backend avx2 \
+    --blocks 4 --out artifacts/fusion-ablation.json
+```
 
 ### 阶段 2：SIMD 后端、卷积微内核与工作区
 

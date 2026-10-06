@@ -78,17 +78,18 @@ void add(const Node& node, std::vector<Tensor>& t, Workspace&) {
 }
 
 // SiLU(x) = x * sigmoid(x)。负半轴用 exp(x)，避免 exp(-x) 上溢。
+// 独立 SiLU 节点和卷积收尾融合共用这一个函数，两条路径才能逐位一致。
+float silu_scalar(float v) {
+    const float e = std::exp(-std::fabs(v));
+    return v * (v >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e));
+}
+
 void silu(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "SiLU 需要一个输入和一个输出");
     const Tensor& x = t[node.inputs[0]];
     Tensor& y = t[node.outputs[0]];
     YI_CHECK(x.shape == y.shape, "SiLU 输入输出形状必须一致");
-    for (int64_t i = 0; i < x.numel(); ++i) {
-        const float v = x.data[i];
-        const float e = std::exp(-std::fabs(v));
-        const float sigmoid = v >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e);
-        y.data[i] = v * sigmoid;
-    }
+    for (int64_t i = 0; i < x.numel(); ++i) y.data[i] = silu_scalar(x.data[i]);
 }
 
 // 空间算子只接受连续的四维 NCHW；检查在任何输出写入之前完成。
@@ -181,12 +182,15 @@ void upsample_nearest(const Node& node, std::vector<Tensor>& t, Workspace&) {
 
 // 直接卷积（不翻转卷积核）：group=1、dilation=1、权重 OIHW，逐输出点累加。
 // 这是正确性基线，不使用 im2col、手写 SIMD、线程或额外工作区。
+// act=1 时激活（SiLU）在收尾里直接算：卷积结果不写回内存再读一遍。
 void conv(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 3 && node.outputs.size() == 1, "Conv 需要输入、权重、偏置以及一个输出");
     const Tensor& x = t[node.inputs[0]];
     const Tensor& weight = t[node.inputs[1]];
     const Tensor& bias = t[node.inputs[2]];
     Tensor& y = t[node.outputs[0]];
+    const int64_t act = node.attrs.has("act") ? node.attrs.i("act") : 0;
+    YI_CHECK(act == 0 || act == 1, "Conv 的 act 只支持 0（无）或 1（SiLU）");
     const auto win = window_for(node, x, y);
     YI_CHECK(weight.is_const && bias.is_const, "Conv 权重与偏置必须是常量");
     YI_CHECK(weight.shape.size() == 4, "Conv 权重必须是四维 OIHW");
@@ -215,7 +219,8 @@ void conv(const Node& node, std::vector<Tensor>& t, Workspace&) {
                             }
                         }
                     }
-                    yp[oh * Wo + ow] = sum + bias.data[co];
+                    const float v = sum + bias.data[co];
+                    yp[oh * Wo + ow] = act == 1 ? silu_scalar(v) : v;
                 }
             }
         }

@@ -65,6 +65,13 @@ struct ConvShape {
     size_t col_bytes;
 };
 
+// 1×1、stride=1、无填充时 K=Cin、N=H*W，展开矩阵 B 恰好就是输入本身（每个输入通道一行）。
+// 满足这个条件就不必把输入拷贝进 col 缓冲，把 col 直接指向输入即可。
+inline bool im2col_identity(const ConvShape& s) {
+    return s.win.k[0] == 1 && s.win.k[1] == 1 && s.win.stride[0] == 1 && s.win.stride[1] == 1 &&
+           s.win.pad[0] == 0 && s.win.pad[1] == 0 && s.win.pad[2] == 0 && s.win.pad[3] == 0;
+}
+
 inline ConvShape conv_shape(const Node& node, const std::vector<Tensor>& t) {
     YI_CHECK(node.inputs.size() == 3 && node.outputs.size() == 1, "Conv 需要 X/W/B 和一个输出");
     const auto& x = t[node.inputs[0]];
@@ -88,6 +95,7 @@ inline ConvShape conv_shape(const Node& node, const std::vector<Tensor>& t) {
 inline size_t conv_workspace(const Node& node, const std::vector<Tensor>& t, int nr) {
     const auto s = conv_shape(node, t);
     const size_t panel = mul_size(mul_size(s.K, nr), sizeof(float));
+    if (im2col_identity(s)) return panel;   // col 直接借用输入，不需要展开缓冲
     YI_CHECK(panel <= std::numeric_limits<size_t>::max() - s.col_bytes, "Conv 面板工作区溢出");
     return s.col_bytes + panel;
 }
@@ -137,6 +145,26 @@ typename V::F exp_reduced(typename V::F x) {
     return V::mul(p, V::pow2(n));
 }
 
+// 向量版 SiLU。独立 SiLU 节点和卷积收尾融合共用它，两条路径对相同输入逐位一致。
+template <class V>
+typename V::F silu_vec(typename V::F v) {
+    const auto e = exp_reduced<V>(V::sub(V::zero(), V::abs(v)));
+    const auto numerator = V::select(V::ge(v, V::zero()), V::set(1.0f), e);
+    return V::mul(v, V::div(numerator, V::add(V::set(1.0f), e)));
+}
+
+// 完整向量组里出现 |x|>80 或非有限数时，整组退回稳定标量公式，不做钳位。
+template <class V>
+typename V::F silu_vec_guarded(typename V::F v) {
+    if (V::mask(V::bit_or(V::gt(V::abs(v), V::set(80.0f)), V::unordered(v, v)))) {
+        alignas(64) float tmp[V::width];
+        V::store(tmp, v);
+        for (int i = 0; i < V::width; ++i) tmp[i] = scalar_silu(tmp[i]);
+        return V::load(tmp);
+    }
+    return silu_vec<V>(v);
+}
+
 template <class V>
 void add_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(node.inputs.size() == 2 && node.outputs.size() == 1, "Add 需要两个输入和一个输出");
@@ -155,16 +183,8 @@ void silu_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(x.shape == y.shape, "SiLU 输入输出形状必须一致");
     const int64_t count = x.numel();
     int64_t i = 0;
-    for (; i + V::width <= count; i += V::width) {
-        const auto v = V::load(x.data + i), abs = V::abs(v);
-        if (V::mask(V::bit_or(V::gt(abs, V::set(80.0f)), V::unordered(v, v)))) {
-            for (int j = 0; j < V::width; ++j) y.data[i + j] = scalar_silu(x.data[i + j]);
-            continue;
-        }
-        const auto e = exp_reduced<V>(V::sub(V::zero(), abs));
-        const auto numerator = V::select(V::ge(v, V::zero()), V::set(1.0f), e);
-        V::store(y.data + i, V::mul(v, V::div(numerator, V::add(V::set(1.0f), e))));
-    }
+    for (; i + V::width <= count; i += V::width)
+        V::store(y.data + i, silu_vec_guarded<V>(V::load(x.data + i)));
     for (; i < count; ++i) y.data[i] = scalar_silu(x.data[i]);
 }
 
@@ -215,9 +235,13 @@ void maxpool_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
 }
 
 template <class V>
-void store_gemm_row(float* dst, typename V::F lo, typename V::F hi, float bias, int cols) {
+void store_gemm_row(float* dst, typename V::F lo, typename V::F hi, float bias, int cols, bool act) {
     const auto b = V::set(bias);
     lo = V::add(lo, b); hi = V::add(hi, b);
+    if (act) {   // 收尾融合：激活在寄存器里直接算，省掉中间张量的一次写回和一次读取
+        lo = silu_vec_guarded<V>(lo);
+        hi = silu_vec_guarded<V>(hi);
+    }
     if (cols == 2 * V::width) {
         V::store(dst, lo); V::store(dst + V::width, hi);
     } else {
@@ -228,10 +252,10 @@ void store_gemm_row(float* dst, typename V::F lo, typename V::F hi, float bias, 
 }
 
 // MR=4、NR=2*向量宽度：8个独立向量累加器，外加2个B向量和1个A广播值。
-// Rows 在编译期决定，M尾部不读取不存在的权重行；N尾部只写有效列。
+// Rows 在编译期决定，M尾部不读取不存在的权重行；N尾部只写有效列。act 为真时收尾直接算 SiLU。
 template <class V, int Rows>
 void gemm_tile(const float* weights, const float* panel, const float* bias, float* out,
-               int64_t K, int64_t N, int cols) {
+               int64_t K, int64_t N, int cols, bool act) {
     auto c00 = V::zero(), c01 = V::zero(), c10 = V::zero(), c11 = V::zero();
     auto c20 = V::zero(), c21 = V::zero(), c30 = V::zero(), c31 = V::zero();
     for (int64_t k = 0; k < K; ++k) {
@@ -242,24 +266,28 @@ void gemm_tile(const float* weights, const float* panel, const float* bias, floa
         if constexpr (Rows > 2) { a = V::set(weights[2 * K + k]); c20 = V::madd(a, b0, c20); c21 = V::madd(a, b1, c21); }
         if constexpr (Rows > 3) { a = V::set(weights[3 * K + k]); c30 = V::madd(a, b0, c30); c31 = V::madd(a, b1, c31); }
     }
-    store_gemm_row<V>(out, c00, c01, bias[0], cols);
-    if constexpr (Rows > 1) store_gemm_row<V>(out + N, c10, c11, bias[1], cols);
-    if constexpr (Rows > 2) store_gemm_row<V>(out + 2 * N, c20, c21, bias[2], cols);
-    if constexpr (Rows > 3) store_gemm_row<V>(out + 3 * N, c30, c31, bias[3], cols);
+    store_gemm_row<V>(out, c00, c01, bias[0], cols, act);
+    if constexpr (Rows > 1) store_gemm_row<V>(out + N, c10, c11, bias[1], cols, act);
+    if constexpr (Rows > 2) store_gemm_row<V>(out + 2 * N, c20, c21, bias[2], cols, act);
+    if constexpr (Rows > 3) store_gemm_row<V>(out + 3 * N, c30, c31, bias[3], cols, act);
 }
 
 template <class V>
 void conv_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
     const auto s = conv_shape(node, t);
+    const int64_t act = node.attrs.has("act") ? node.attrs.i("act") : 0;
+    YI_CHECK(act == 0 || act == 1, "Conv 的 act 只支持 0（无）或 1（SiLU）");
     constexpr int NR = 2 * V::width;
     const size_t required = conv_workspace(node, t, NR);
     YI_CHECK(workspace.data && workspace.bytes >= required, "Conv 工作区不足");
     const auto& x = t[node.inputs[0]]; const auto& w = t[node.inputs[1]]; const auto& bias = t[node.inputs[2]];
     auto& y = t[node.outputs[0]];
-    float* col = workspace.data;
-    float* panel = reinterpret_cast<float*>(reinterpret_cast<char*>(workspace.data) + s.col_bytes);
+    // 1×1 直通：展开矩阵就是输入本身，col 指向输入，省掉一次整张量拷贝；面板仍用工作区。
+    const bool identity = im2col_identity(s);
+    float* panel = reinterpret_cast<float*>(reinterpret_cast<char*>(workspace.data) + (identity ? 0 : s.col_bytes));
     for (int64_t batch = 0; batch < x.shape[0]; ++batch) {
-        im2col(x, y, s, batch, col);
+        float* col = identity ? x.data + batch * s.K * s.N : workspace.data;
+        if (!identity) im2col(x, y, s, batch, col);
         float* out = y.data + batch * s.M * s.N;
         for (int64_t j = 0; j < s.N; j += NR) {
             const int cols = static_cast<int>(std::min<int64_t>(NR, s.N - j));
@@ -272,10 +300,10 @@ void conv_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
                 const float* bm = bias.data + m;
                 float* ym = out + m * s.N + j;
                 switch (std::min<int64_t>(4, s.M - m)) {
-                    case 4: gemm_tile<V, 4>(wm, panel, bm, ym, s.K, s.N, cols); break;
-                    case 3: gemm_tile<V, 3>(wm, panel, bm, ym, s.K, s.N, cols); break;
-                    case 2: gemm_tile<V, 2>(wm, panel, bm, ym, s.K, s.N, cols); break;
-                    case 1: gemm_tile<V, 1>(wm, panel, bm, ym, s.K, s.N, cols); break;
+                    case 4: gemm_tile<V, 4>(wm, panel, bm, ym, s.K, s.N, cols, act == 1); break;
+                    case 3: gemm_tile<V, 3>(wm, panel, bm, ym, s.K, s.N, cols, act == 1); break;
+                    case 2: gemm_tile<V, 2>(wm, panel, bm, ym, s.K, s.N, cols, act == 1); break;
+                    case 1: gemm_tile<V, 1>(wm, panel, bm, ym, s.K, s.N, cols, act == 1); break;
                 }
             }
         }

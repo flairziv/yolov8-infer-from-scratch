@@ -78,7 +78,8 @@ Model Model::load(const std::string& dir) {
             std::string name;
             int version = 0;
             ss >> name >> version;
-            YI_CHECK(name == "yolov8-infer" && version == 1, path << " 不是本运行时能读的格式: " << line);
+            // 版本 2 增加了 Conv 的可选 act 属性；版本 1 没有该属性，语义等价于 act 缺省。
+            YI_CHECK(name == "yolov8-infer" && (version == 1 || version == 2), path << " 不是本运行时能读的格式: " << line);
         } else if (kw == "weights") {
             ss >> weights_file >> weights_bytes;
         } else if (kw == "input" || kw == "output") {

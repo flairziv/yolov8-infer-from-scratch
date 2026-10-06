@@ -170,6 +170,32 @@ def fuse_silu(graph: gs.Graph, target_op: str = "SiLU", domain: str = "", attrs:
     return stats
 
 
+def fuse_conv_silu(graph: gs.Graph) -> dict:
+    """Conv → SiLU 两个节点合并成一个带 act=1 的 Conv：激活在卷积收尾里直接算，中间结果不再写回内存。
+
+    模式：c = Conv(...)；y = SiLU(c)；c 只被这个 SiLU 消费；c 不是图输出。
+    改边：Conv 沿用 SiLU 的输出张量 y（下游不用改），属性加 act=1；SiLU 断开后由 cleanup 删。
+    数值上与两个节点一致：卷积结果不变，只是同一个值不再经历一次"存储再读取"。
+    """
+    stats = {"fused": 0, "skipped": []}
+    for silu in [n for n in graph.nodes if n.op == "SiLU"]:
+        c = silu.inputs[0]
+        if len(c.inputs) != 1 or c.inputs[0].op != "Conv":
+            stats["skipped"].append((silu.name, "上游不是 Conv")); continue
+        if len(c.outputs) != 1:
+            stats["skipped"].append((silu.name, f"Conv 输出有 {len(c.outputs)} 个消费者")); continue
+        if c in graph.outputs:
+            stats["skipped"].append((silu.name, "Conv 输出是图输出")); continue
+        conv = c.inputs[0]
+        y = silu.outputs[0]
+        silu.outputs.clear(); silu.inputs.clear()
+        conv.outputs = [y]
+        conv.attrs["act"] = 1
+        stats["fused"] += 1
+    graph.cleanup().toposort()
+    return stats
+
+
 def fuse_slices_to_split(graph: gs.Graph) -> dict:
     """同一张量、同一轴上首尾相接、恰好覆盖整个轴的一组 Slice，换成一个 Split。
 

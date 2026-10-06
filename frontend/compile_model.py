@@ -1,10 +1,13 @@
 """编译：yolov8n_bn.onnx → 图优化 → 切出运行时要跑的子图 → artifacts/model/{model.txt, weights.bin}
 
 流程（每一步都是 passes.py 里的一个 pass）：
-  BN 折叠 → 常量折叠（和形状推导交替，直到不动点）→ Slice 组合成 Split → SiLU 融合 → 按运行时支持的算子切图 → 降级成运行时算子并写文件
+  BN 折叠 → 常量折叠（和形状推导交替，直到不动点）→ Slice 组合成 Split → SiLU 融合 → Conv 收尾融合
+  → 按运行时支持的算子切图 → 降级成运行时算子并写文件
 
 另存 artifacts/yolov8n_opt.onnx：做完 BN / 常量折叠和 Slice→Split、还没做 SiLU 融合的图。
 它全是标准 ONNX 算子，张量名、数值都和运行时子图一致；make_reference.py 用 ORT 跑它拿逐层参考数据。
+
+--no-fuse-act 关掉 Conv 收尾融合，用于"融合 vs 不融合"的同机对照实验。
 """
 import argparse
 import collections
@@ -16,18 +19,20 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 
-from passes import fold_bn, fold_constants, fuse_silu, fuse_slices_to_split, partition_graph
+from passes import fold_bn, fold_constants, fuse_conv_silu, fuse_silu, fuse_slices_to_split, partition_graph
 
 warnings.filterwarnings("ignore")
 
-FORMAT = "yolov8-infer 1"
+# 版本 2 增加了 Conv 的可选 act 属性（1 = SiLU 收尾融合）。旧运行时读到 2 会明确拒绝，
+# 而不是把 act 当未知属性忽略后算出一份没有激活的错误结果。
+FORMAT = "yolov8-infer 2"
 ALIGN = 64      # weights.bin 里每个常量的起点按 64 字节对齐：一条缓存行，也满足 SSE/AVX/AVX-512 的对齐读
 # 运行时实现的 ONNX 算子（SiLU 是融合后的名字）。不在这里的算子都留给后处理
 SUPPORTED = {"Conv", "SiLU", "MaxPool", "Resize", "Concat", "Split", "Add"}
 
 
-def optimize(src, opt_path):
-    """跑 pass 链，返回融合完 SiLU 的 gs 图；途中把标准算子版的等价图存到 opt_path。"""
+def optimize(src, opt_path, fuse_act=True):
+    """跑 pass 链，返回做完融合的 gs 图；途中把标准算子版的等价图存到 opt_path。"""
     m = onnx.load(src)
     n_src = len(m.graph.node)
     g = gs.import_onnx(m)
@@ -53,9 +58,11 @@ def optimize(src, opt_path):
     onnx.save(m_opt, opt_path)
 
     silu = fuse_silu(g, "SiLU")
+    act = fuse_conv_silu(g) if fuse_act else {"fused": 0, "skipped": []}
     print(f"[compile] 图优化 {src}")
     print(f"  原图 {n_src} 节点 → BN 折叠 {n_bn} 个 → 常量折叠 {rounds} 轮后 {n_fold} 节点"
-          f" → Slice 合成 Split {n_split} 个 → SiLU 融合 {silu['fused']} 个（跳过 {len(silu['skipped'])} 个）→ {len(g.nodes)} 节点")
+          f" → Slice 合成 Split {n_split} 个 → SiLU 融合 {silu['fused']} 个（跳过 {len(silu['skipped'])} 个）"
+          f" → Conv 收尾融合 {act['fused']} 个（跳过 {len(act['skipped'])} 个）→ {len(g.nodes)} 节点")
     print(f"  标准算子版等价图 → {opt_path}")
     return g
 
@@ -91,8 +98,13 @@ def lower(node):
         need(a.get("auto_pad", "NOTSET") == "NOTSET", "不支持 auto_pad")
         k = ints(ins[1].values.shape[2:])
         need(ints(a.get("kernel_shape", k)) == k, "kernel_shape 和权重形状不一致")
+        act = int(a.get("act", 0))
+        need(act in (0, 1), f"act 只支持 0（无）或 1（SiLU），实际 {act}")
         # pad 的顺序和 ONNX 一样：[上, 左, 下, 右]
-        return "Conv", {"kernel": k, "stride": ints(a.get("strides", [1, 1])), "pad": ints(a.get("pads", [0, 0, 0, 0]))}, list(ins)
+        attrs = {"kernel": k, "stride": ints(a.get("strides", [1, 1])), "pad": ints(a.get("pads", [0, 0, 0, 0]))}
+        if act:
+            attrs["act"] = act
+        return "Conv", attrs, list(ins)
     if op == "SiLU":
         return "SiLU", {}, [ins[0]]
     if op == "MaxPool":
@@ -186,9 +198,10 @@ def main():
     ap.add_argument("--onnx", default="artifacts/yolov8n_bn.onnx", help="export_onnx.py 导出的、还带 BN 的 ONNX")
     ap.add_argument("--opt", default="artifacts/yolov8n_opt.onnx", help="另存的标准算子版等价图（生成参考数据用）")
     ap.add_argument("--out", default="artifacts/model")
+    ap.add_argument("--no-fuse-act", action="store_true", help="关掉 Conv 收尾融合，生成对照模型（消融实验用）")
     args = ap.parse_args()
 
-    g = optimize(args.onnx, args.opt)
+    g = optimize(args.onnx, args.opt, fuse_act=not args.no_fuse_act)
     r = partition_graph(g, SUPPORTED, single_cut=True)
     outs = sorted(r["cut"], key=head_order)
     print(f"  切图：运行时 {len(r['dev'])} 节点，后处理 {len(r['host'])} 节点"

@@ -56,7 +56,8 @@ class RefOpsTest(unittest.TestCase):
                     ref_blob.extend(v.tobytes())
             header = ["format yolov8-infer 1", f"weights weights.bin {len(weights)}"]
             header += [f"input {name}" for name in inputs] + ["output y"]
-            args = " ".join(f"{key}=" + ",".join(map(str, value)) for key, value in attrs.items())
+            args = " ".join(f"{key}=" + ",".join(map(str, value if isinstance(value, (list, tuple)) else [value]))
+                            for key, value in attrs.items())
             names = ",".join([*inputs, *constants])
             lines.append(f"node {op} tested in={names} out=y {args}")
             (root / "model.txt").write_text("\n".join(header + lines) + "\n", encoding="utf-8")
@@ -140,6 +141,8 @@ class RefOpsTest(unittest.TestCase):
             ((2, 3, 5, 7), 4, (3, 3), (1, 1), (1, 1, 1, 1)),
             ((1, 2, 6, 7), 3, (3, 3), (2, 2), (1, 1, 1, 1)),
             ((2, 2, 4, 6), 3, (2, 3), (1, 2), (0, 1, 1, 0)),
+            ((1, 2, 6, 7), 3, (1, 1), (2, 2), (1, 1, 1, 1)),   # 1×1 但 stride=2，不能直通
+            ((1, 2, 5, 5), 3, (1, 1), (1, 1), (0, 1, 1, 0)),   # 1×1 但带填充，不能直通
         ]
         rng = np.random.default_rng(13)
         for shape, cout, kernel, stride, pad in cases:
@@ -153,6 +156,41 @@ class RefOpsTest(unittest.TestCase):
                 y = reference([helper.make_node("Conv", ["x", "w", "b"], ["y"], kernel_shape=kernel,
                                                 strides=stride, pads=pad)], {"x": x}, {"w": w, "b": b}, [shape[0], cout, ho, wo])
                 self.run_kernel("Conv", {"x": x}, {"w": w, "b": b}, attrs, y)
+
+    def test_conv_silu_epilogue(self):
+        # act=1 的卷积收尾：参考是标准的 Conv → Sigmoid → Mul 三节点写法。
+        rng = np.random.default_rng(31)
+        cases = [
+            ((1, 2, 3, 5), 3, (3, 3), (1, 1), (1, 1, 1, 1), None),
+            ((2, 2, 4, 8), 5, (1, 1), (1, 1), (0, 0, 0, 0), None),        # 1×1 直通 + 收尾
+            ((1, 3, 5, 6), 4, (3, 3), (2, 2), (1, 1, 1, 1), None),
+            ((1, 2, 4, 4), 3, (3, 3), (1, 1), (1, 1, 1, 1), -4.0),        # 偏置压负，走 SiLU 负半轴
+        ]
+        for shape, cout, kernel, stride, pad, bias_value in cases:
+            with self.subTest(shape=shape, kernel=kernel, stride=stride, pad=pad, bias=bias_value):
+                x = rng.normal(size=shape).astype(np.float32)
+                w = (rng.normal(size=(cout, shape[1], *kernel)) * 0.5).astype(np.float32)
+                if bias_value is None:
+                    b = rng.normal(size=(cout,)).astype(np.float32)
+                else:
+                    b = np.full(cout, bias_value, dtype=np.float32)
+                ho = (shape[2] + pad[0] + pad[2] - kernel[0]) // stride[0] + 1
+                wo = (shape[3] + pad[1] + pad[3] - kernel[1]) // stride[1] + 1
+                y = reference([
+                    helper.make_node("Conv", ["x", "w", "b"], ["c"], kernel_shape=kernel, strides=stride, pads=pad),
+                    helper.make_node("Sigmoid", ["c"], ["s"]),
+                    helper.make_node("Mul", ["c", "s"], ["y"]),
+                ], {"x": x}, {"w": w, "b": b}, [shape[0], cout, ho, wo])
+                attrs = {"kernel": list(kernel), "stride": list(stride), "pad": list(pad), "act": 1}
+                self.run_kernel("Conv", {"x": x}, {"w": w, "b": b}, attrs, y)
+
+    def test_conv_rejects_unknown_act(self):
+        x = np.ones((1, 1, 3, 3), np.float32)
+        w = np.ones((1, 1, 2, 2), np.float32)
+        b = np.zeros(1, np.float32)
+        self.run_kernel("Conv", {"x": x}, {"w": w, "b": b},
+                        {"kernel": [2, 2], "stride": [1, 1], "pad": [0, 0, 0, 0], "act": 2},
+                        np.zeros((1, 1, 2, 2), np.float32), rejected=True)
 
     def test_conv_known_cross_correlation(self):
         x = np.arange(1, 10, dtype=np.float32).reshape(1, 1, 3, 3)

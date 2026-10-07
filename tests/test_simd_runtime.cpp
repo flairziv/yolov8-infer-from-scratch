@@ -119,6 +119,75 @@ void check_fused(Backend backend) {
     }
     std::printf("PASS %s fused-epilogue\n", backend_name(backend));
 }
+// 多线程检查用的模型：一个足够大的 3×3 卷积（K*N 超过 im2col 并行阈值，列块数远超线程数）。
+Model big_conv_model() {
+    Model m;
+    auto add = [&](const char* name, std::vector<int64_t> shape, int64_t offset = -1) {
+        Tensor t;
+        t.name = name;
+        t.shape = std::move(shape);
+        t.is_const = offset >= 0;
+        t.const_offset = offset;
+        m.index[t.name] = static_cast<int>(m.tensors.size());
+        m.tensors.push_back(std::move(t));
+    };
+    add("x", {1, 3, 64, 64});
+    add("w", {8, 3, 3, 3}, 0);
+    add("b", {8}, 864);
+    add("y", {1, 8, 64, 64});
+    m.weights = AlignedBuffer(896);
+    for (auto& t : m.tensors) {
+        if (!t.is_const) continue;
+        t.data = reinterpret_cast<float*>(m.weights.as<char>() + t.const_offset);
+        for (int64_t i = 0; i < t.numel(); ++i) t.data[i] = static_cast<float>((i * 5 + 1) % 23 - 11) * 0.03f;
+    }
+    Node c;
+    c.name = "conv"; c.op = "Conv"; c.inputs = {0, 1, 2}; c.outputs = {3};
+    c.attrs.kv = {{"kernel", {3, 3}}, {"stride", {1, 1}}, {"pad", {1, 1, 1, 1}}, {"act", {1}}};
+    m.nodes = {c};
+    m.inputs = {0}; m.outputs = {3};
+    m.validate();
+    return m;
+}
+
+void run_and_copy(Model& model, Executor& ex, const std::vector<float>& input, std::vector<float>& out) {
+    ex.set_input(0, input.data());
+    ex.run();
+    const Tensor& t = model.tensors[model.find("y")];
+    out.assign(t.data, t.data + t.numel());
+}
+
+// 多线程：任意线程数的输出与单线程逐位一致；线程数超过列块数、naive 规划也不得改变结果。
+void check_threads(Backend backend) {
+    Model single_model = toy_model(true), quad_model = toy_model(true), many_model = toy_model(true);
+    Executor single(single_model, true, backend, 1);
+    Executor quad(quad_model, true, backend, 4);
+    Executor many(many_model, true, backend, 16);   // 线程数远多于列块数：多余线程领不到工作单元
+    YI_CHECK(quad.workspace_bytes() > single.workspace_bytes(), "多线程没有为每个线程留面板");
+    YI_CHECK(many.workspace_bytes() > quad.workspace_bytes(), "面板槽位不随线程数增长");
+    std::vector<float> input(2 * 3 * 5 * 7), a, b, c;
+    for (size_t i = 0; i < input.size(); ++i) input[i] = std::cos(static_cast<float>(i) * 0.11f) * 2;
+    run_and_copy(single_model, single, input, a);
+    run_and_copy(quad_model, quad, input, b);
+    run_and_copy(many_model, many, input, c);
+    YI_CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0, "4 线程与单线程输出不逐位一致");
+    YI_CHECK(std::memcmp(a.data(), c.data(), a.size() * sizeof(float)) == 0, "16 线程与单线程输出不逐位一致");
+
+    // 大卷积：并行 im2col（K*N 超阈值）与 256 个列块；naive 规划在多线程下同样逐位一致。
+    Model big_single = big_conv_model(), big_quad = big_conv_model(), big_naive = big_conv_model();
+    Executor bs(big_single, true, backend, 1), bq(big_quad, true, backend, 4), bn(big_naive, false, backend, 4);
+    std::vector<float> big_input(3 * 64 * 64), big_a, big_b, big_c;
+    for (size_t i = 0; i < big_input.size(); ++i) big_input[i] = std::sin(static_cast<float>(i) * 0.07f);
+    run_and_copy(big_single, bs, big_input, big_a);
+    run_and_copy(big_quad, bq, big_input, big_b);
+    run_and_copy(big_naive, bn, big_input, big_c);
+    YI_CHECK(std::memcmp(big_a.data(), big_b.data(), big_a.size() * sizeof(float)) == 0,
+             "大卷积多线程输出不逐位一致");
+    YI_CHECK(std::memcmp(big_a.data(), big_c.data(), big_a.size() * sizeof(float)) == 0,
+             "多线程 naive 规划输出不逐位一致");
+    std::printf("PASS %s threads=1/4/16 workspace=%zu/%zu/%zu\n", backend_name(backend),
+                single.workspace_bytes(), quad.workspace_bytes(), many.workspace_bytes());
+}
 }  // namespace
 
 int main() {
@@ -127,6 +196,7 @@ int main() {
             if (backend_available(backend)) {
                 check_backend(backend);
                 check_fused(backend);
+                check_threads(backend);
             } else {
                 std::printf("SKIP %s unavailable\n", backend_name(backend));
             }

@@ -8,8 +8,11 @@
 
 namespace yi {
 
-Executor::Executor(Model& model, bool reuse, Backend backend) : model_(model), backend_(backend) {
+Executor::Executor(Model& model, bool reuse, Backend backend, int threads)
+    : model_(model), backend_(backend), threads_(threads) {
     require_backend(backend_);
+    YI_CHECK(threads_ >= 1, "线程数至少是 1");
+    if (threads_ > 1) pool_ = std::make_unique<ThreadPool>(threads_);
     const MemoryPlan plan = reuse ? plan_reuse(model_) : plan_naive(model_);
     arena_ = AlignedBuffer(plan.total);
     for (size_t i = 0; i < model_.tensors.size(); ++i) {
@@ -22,10 +25,10 @@ Executor::Executor(Model& model, bool reuse, Backend backend) : model_(model), b
         kernels_.push_back(selected.fn);
         if (selected.simd) ++simd_nodes_;
         else if (backend_ != Backend::Scalar && selected.fn) ++fallback_nodes_;
-        workspace_bytes = std::max(workspace_bytes, kernel_workspace_bytes(n, model_.tensors, backend_));
+        workspace_bytes = std::max(workspace_bytes, kernel_workspace_bytes(n, model_.tensors, backend_, threads_));
     }
     workspace_storage_ = AlignedBuffer(workspace_bytes);
-    workspace_ = {workspace_storage_.as<float>(), workspace_bytes};
+    workspace_ = {workspace_storage_.as<float>(), workspace_bytes, pool_.get()};
 }
 
 void Executor::set_input(size_t k, const float* data) {

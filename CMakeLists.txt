@@ -13,23 +13,35 @@ if(MSVC)
   message(FATAL_ERROR "当前构建支持 GCC/Clang（建议 WSL）；尚未实现 MSVC 的 ISA 与 sanitizer 配置")
 endif()
 option(YI_SANITIZE "AddressSanitizer + UBSan" OFF)
+option(YI_TSAN "ThreadSanitizer（并发正确性检查；与 YI_SANITIZE 互斥）" OFF)
 option(YI_ENABLE_X86_SIMD "在 x86-64 GCC/Clang 上构建 SSE2 与 AVX2/FMA 后端" ON)
 
 add_compile_options(-Wall -Wextra)
+if(YI_SANITIZE AND YI_TSAN)
+  message(FATAL_ERROR "YI_SANITIZE 与 YI_TSAN 不能同时开启")
+endif()
 if(YI_SANITIZE)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
 endif()
+if(YI_TSAN)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+endif()
+
+find_package(Threads REQUIRED)
 
 add_library(yinfer_core STATIC
   runtime/common.cpp
   runtime/backend.cpp
   runtime/model.cpp
   runtime/memory_plan.cpp
+  runtime/thread_pool.cpp
   runtime/executor.cpp
   runtime/ops/ref_ops.cpp
   runtime/ops/dispatch.cpp)
 target_include_directories(yinfer_core PUBLIC runtime)
+target_link_libraries(yinfer_core PUBLIC Threads::Threads)
 
 if(YI_ENABLE_X86_SIMD AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"
    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

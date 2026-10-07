@@ -34,10 +34,11 @@ KernelSelection select_kernel(const Node& node, const std::vector<Tensor>& tenso
     return {scalar, false};
 }
 
-size_t kernel_workspace_bytes(const Node& node, const std::vector<Tensor>& tensors, Backend backend) {
+size_t kernel_workspace_bytes(const Node& node, const std::vector<Tensor>& tensors, Backend backend, int threads) {
     require_backend(backend);
+    YI_CHECK(threads >= 1, "线程数至少是 1");
     if (backend == Backend::Scalar || node.op != "Conv") return 0;
-    return detail::conv_workspace(node, tensors, backend == Backend::SSE ? 8 : 16);
+    return detail::conv_workspace(node, tensors, backend == Backend::SSE ? 8 : 16, threads);
 }
 
 }  // namespace yi

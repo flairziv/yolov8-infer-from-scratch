@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "ops.h"
+#include "thread_pool.h"
 
 namespace yi {
 namespace {
@@ -92,33 +93,44 @@ inline ConvShape conv_shape(const Node& node, const std::vector<Tensor>& t) {
     return {win, y.shape[1], static_cast<int64_t>(K), static_cast<int64_t>(N), align_up(bytes)};
 }
 
-inline size_t conv_workspace(const Node& node, const std::vector<Tensor>& t, int nr) {
+// 每个线程一块面板；槽位按 64 字节对齐，并行时互不覆盖。
+inline size_t conv_panel_bytes(const ConvShape& s, int nr) {
+    return align_up(mul_size(mul_size(s.K, nr), sizeof(float)));
+}
+
+inline size_t conv_workspace(const Node& node, const std::vector<Tensor>& t, int nr, int threads) {
     const auto s = conv_shape(node, t);
-    const size_t panel = mul_size(mul_size(s.K, nr), sizeof(float));
+    YI_CHECK(threads >= 1, "线程数至少是 1");
+    const size_t panel = mul_size(conv_panel_bytes(s, nr), static_cast<size_t>(threads));
     if (im2col_identity(s)) return panel;   // col 直接借用输入，不需要展开缓冲
     YI_CHECK(panel <= std::numeric_limits<size_t>::max() - s.col_bytes, "Conv 面板工作区溢出");
     return s.col_bytes + panel;
 }
 
-// 一次展开一个 batch，列坐标是展平的输出空间；batch 间复用同一工作区。
-inline void im2col(const Tensor& x, const Tensor& y, const ConvShape& s, int64_t batch, float* col) {
+// 展开矩阵的一行：第 k 行对应 (ci, kh, kw)，写入 col + k*N。行与行互不相干，可以并行。
+inline void im2col_row(const Tensor& x, const Tensor& y, const ConvShape& s, int64_t batch, int64_t k, float* col) {
     const int64_t H = x.shape[2], W = x.shape[3], Ho = y.shape[2], Wo = y.shape[3];
-    int64_t k = 0;
-    for (int64_t ci = 0; ci < x.shape[1]; ++ci) {
-        const float* plane = x.data + (batch * x.shape[1] + ci) * H * W;
-        for (int64_t kh = 0; kh < s.win.k[0]; ++kh) {
-            for (int64_t kw = 0; kw < s.win.k[1]; ++kw, ++k) {
-                float* row = col + k * s.N;
-                for (int64_t oh = 0; oh < Ho; ++oh) {
-                    const int64_t ih = oh * s.win.stride[0] + kh - s.win.pad[0];
-                    for (int64_t ow = 0; ow < Wo; ++ow) {
-                        const int64_t iw = ow * s.win.stride[1] + kw - s.win.pad[1];
-                        row[oh * Wo + ow] = ih >= 0 && ih < H && iw >= 0 && iw < W ? plane[ih * W + iw] : 0.0f;
-                    }
-                }
-            }
+    const int64_t kw_n = s.win.k[1];
+    const int64_t ci = k / (s.win.k[0] * kw_n), rem = k % (s.win.k[0] * kw_n);
+    const int64_t kh = rem / kw_n, kw = rem % kw_n;
+    const float* plane = x.data + (batch * x.shape[1] + ci) * H * W;
+    float* row = col + k * s.N;
+    for (int64_t oh = 0; oh < Ho; ++oh) {
+        const int64_t ih = oh * s.win.stride[0] + kh - s.win.pad[0];
+        for (int64_t ow = 0; ow < Wo; ++ow) {
+            const int64_t iw = ow * s.win.stride[1] + kw - s.win.pad[1];
+            row[oh * Wo + ow] = ih >= 0 && ih < H && iw >= 0 && iw < W ? plane[ih * W + iw] : 0.0f;
         }
     }
+}
+
+// 一次展开一个 batch，列坐标是展平的输出空间；batch 间复用同一工作区。
+inline void im2col(const Tensor& x, const Tensor& y, const ConvShape& s, int64_t batch, float* col, ThreadPool* pool) {
+    if (pool && s.K * s.N >= (1 << 16)) {   // 小层不值得付唤醒线程的固定开销
+        pool->parallel_for(s.K, [&](int64_t k) { im2col_row(x, y, s, batch, k, col); });
+        return;
+    }
+    for (int64_t k = 0; k < s.K; ++k) im2col_row(x, y, s, batch, k, col);
 }
 
 inline float scalar_silu(float v) {
@@ -165,37 +177,58 @@ typename V::F silu_vec_guarded(typename V::F v) {
     return silu_vec<V>(v);
 }
 
+// 逐元素算子的并行粒度：按固定大小的块切分。块长是 64 的倍数，
+// 向量主循环的边界不因切分而改变，逐元素结果与串行完全一致。
+constexpr int64_t kElementChunk = 1 << 15;
+
 template <class V>
-void add_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
+void add_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
     YI_CHECK(node.inputs.size() == 2 && node.outputs.size() == 1, "Add 需要两个输入和一个输出");
     const auto& a = t[node.inputs[0]]; const auto& b = t[node.inputs[1]]; auto& y = t[node.outputs[0]];
     YI_CHECK(a.shape == b.shape && a.shape == y.shape, "Add 只支持同形状相加");
     const int64_t count = y.numel();
-    int64_t i = 0;
-    for (; i + V::width <= count; i += V::width) V::store(y.data + i, V::add(V::load(a.data + i), V::load(b.data + i)));
-    for (; i < count; ++i) y.data[i] = a.data[i] + b.data[i];
+    auto chunk = [&](int64_t begin, int64_t end) {
+        int64_t i = begin;
+        for (; i + V::width <= end; i += V::width) V::store(y.data + i, V::add(V::load(a.data + i), V::load(b.data + i)));
+        for (; i < end; ++i) y.data[i] = a.data[i] + b.data[i];
+    };
+    if (workspace.pool && count >= 2 * kElementChunk)
+        workspace.pool->parallel_for((count + kElementChunk - 1) / kElementChunk, [&](int64_t c) {
+            chunk(c * kElementChunk, std::min(count, (c + 1) * kElementChunk));
+        });
+    else
+        chunk(0, count);
 }
 
 template <class V>
-void silu_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
+void silu_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
     YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "SiLU 需要一个输入和一个输出");
     const auto& x = t[node.inputs[0]]; auto& y = t[node.outputs[0]];
     YI_CHECK(x.shape == y.shape, "SiLU 输入输出形状必须一致");
     const int64_t count = x.numel();
-    int64_t i = 0;
-    for (; i + V::width <= count; i += V::width)
-        V::store(y.data + i, silu_vec_guarded<V>(V::load(x.data + i)));
-    for (; i < count; ++i) y.data[i] = scalar_silu(x.data[i]);
+    auto chunk = [&](int64_t begin, int64_t end) {
+        int64_t i = begin;
+        for (; i + V::width <= end; i += V::width)
+            V::store(y.data + i, silu_vec_guarded<V>(V::load(x.data + i)));
+        for (; i < end; ++i) y.data[i] = scalar_silu(x.data[i]);
+    };
+    if (workspace.pool && count >= 2 * kElementChunk)
+        workspace.pool->parallel_for((count + kElementChunk - 1) / kElementChunk, [&](int64_t c) {
+            chunk(c * kElementChunk, std::min(count, (c + 1) * kElementChunk));
+        });
+    else
+        chunk(0, count);
 }
 
 template <class V>
-void maxpool_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
+void maxpool_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
     YI_CHECK(node.inputs.size() == 1 && node.outputs.size() == 1, "MaxPool 需要一个输入和一个输出");
     const auto& x = t[node.inputs[0]]; auto& y = t[node.outputs[0]];
     const auto w = window(node, x, y);
     YI_CHECK(x.shape[1] == y.shape[1], "MaxPool 不能改变通道数");
     const int64_t H = x.shape[2], W = x.shape[3], Ho = y.shape[2], Wo = y.shape[3];
-    for (int64_t nc = 0; nc < x.shape[0] * x.shape[1]; ++nc) {
+    // 每个 (n, c) 平面各算各的，按平面并行；平面内算法与串行完全相同。
+    auto plane_body = [&](int64_t nc) {
         const float* xp = x.data + nc * H * W;
         float* yp = y.data + nc * Ho * Wo;
         for (int64_t oh = 0; oh < Ho; ++oh) {
@@ -231,7 +264,12 @@ void maxpool_simd(const Node& node, std::vector<Tensor>& t, Workspace&) {
                 }
             }
         }
-    }
+    };
+    const int64_t planes = x.shape[0] * x.shape[1];
+    if (workspace.pool && planes > 1)
+        workspace.pool->parallel_for(planes, plane_body);
+    else
+        for (int64_t nc = 0; nc < planes; ++nc) plane_body(nc);
 }
 
 template <class V>
@@ -278,19 +316,25 @@ void conv_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
     const int64_t act = node.attrs.has("act") ? node.attrs.i("act") : 0;
     YI_CHECK(act == 0 || act == 1, "Conv 的 act 只支持 0（无）或 1（SiLU）");
     constexpr int NR = 2 * V::width;
-    const size_t required = conv_workspace(node, t, NR);
+    const int threads = workspace.pool ? workspace.pool->size() : 1;
+    const size_t required = conv_workspace(node, t, NR, threads);
     YI_CHECK(workspace.data && workspace.bytes >= required, "Conv 工作区不足");
     const auto& x = t[node.inputs[0]]; const auto& w = t[node.inputs[1]]; const auto& bias = t[node.inputs[2]];
     auto& y = t[node.outputs[0]];
     // 1×1 直通：展开矩阵就是输入本身，col 指向输入，省掉一次整张量拷贝；面板仍用工作区。
     const bool identity = im2col_identity(s);
-    float* panel = reinterpret_cast<float*>(reinterpret_cast<char*>(workspace.data) + (identity ? 0 : s.col_bytes));
+    const size_t slot_floats = conv_panel_bytes(s, NR) / sizeof(float);
+    float* panel_base = reinterpret_cast<float*>(reinterpret_cast<char*>(workspace.data) + (identity ? 0 : s.col_bytes));
     for (int64_t batch = 0; batch < x.shape[0]; ++batch) {
         float* col = identity ? x.data + batch * s.K * s.N : workspace.data;
-        if (!identity) im2col(x, y, s, batch, col);
+        if (!identity) im2col(x, y, s, batch, col, workspace.pool);
         float* out = y.data + batch * s.M * s.N;
-        for (int64_t j = 0; j < s.N; j += NR) {
+        // 按列块并行：每个单元打包进自己线程的面板槽位，写出的输出列互不重叠。
+        // 单元划分只取决于 N，与线程调度无关 ⇒ 输出与单线程逐位一致。
+        auto gemm_block = [&](int64_t jb) {
+            const int64_t j = jb * NR;
             const int cols = static_cast<int>(std::min<int64_t>(NR, s.N - j));
+            float* panel = panel_base + static_cast<size_t>(ThreadPool::worker_slot()) * slot_floats;
             for (int64_t k = 0; k < s.K; ++k) {
                 std::memcpy(panel + k * NR, col + k * s.N + j, cols * sizeof(float));
                 std::fill(panel + k * NR + cols, panel + (k + 1) * NR, 0.0f);
@@ -306,7 +350,12 @@ void conv_simd(const Node& node, std::vector<Tensor>& t, Workspace& workspace) {
                     case 1: gemm_tile<V, 1>(wm, panel, bm, ym, s.K, s.N, cols, act == 1); break;
                 }
             }
-        }
+        };
+        const int64_t j_blocks = (s.N + NR - 1) / NR;
+        if (workspace.pool && j_blocks > 1)
+            workspace.pool->parallel_for(j_blocks, gemm_block);
+        else
+            for (int64_t jb = 0; jb < j_blocks; ++jb) gemm_block(jb);
     }
 }
 

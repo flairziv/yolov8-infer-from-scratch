@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""同机交错对照：默认比较三种后端；给 --alt-model 时改为比较两个模型的消融实验。
+"""同机交错对照：默认比较三种后端；给 --alt-model 或 --alt-threads 时改为消融实验。
 
 只记录 C++ run 内部计时，不含进程启动与模型加载。每组两块：ABBA、BAAB，每轮都是 fresh process。
 先逐层验证（REF=0、无 FAIL），再预热、采样。后端对照比较的是完整实现差异（算法、im2col、SIMD
-一起变化），不能把结果归因于 SIMD 指令宽度；模型消融用于隔离单个优化（例如收尾融合）。
+一起变化），不能把结果归因于 SIMD 指令宽度；模型/线程消融用于隔离单个优化（例如收尾融合、并行度）。
 """
 import argparse
 from datetime import datetime, timezone
@@ -32,11 +32,11 @@ def command(argv):
     return result.stdout
 
 
-def variant(label, binary, model, ref, backend):
+def variant(label, binary, model, ref, backend, threads):
     binary, model, ref = Path(binary).resolve(), Path(model).resolve(), Path(ref).resolve()
     weights = next(line.split()[1] for line in (model / "model.txt").read_text(encoding="utf-8").splitlines()
                    if line.startswith("weights "))
-    return {"label": label, "binary": binary, "model": model, "ref": ref, "backend": backend,
+    return {"label": label, "binary": binary, "model": model, "ref": ref, "backend": backend, "threads": threads,
             "sha256": {"binary": sha(binary), "model.txt": sha(model / "model.txt"), "weights": sha(model / weights),
                        "ref.txt": sha(ref / "ref.txt"), "ref.bin": sha(ref / "ref.bin")}}
 
@@ -51,9 +51,11 @@ def main():
     ap.add_argument("--candidates", nargs="+", choices=["sse", "avx2"], default=["sse", "avx2"])
     ap.add_argument("--alt-model", default=None, help="消融模式：对照模型目录；与 --alt-ref 一起给出")
     ap.add_argument("--alt-ref", default=None)
-    ap.add_argument("--alt-label", default="alt")
+    ap.add_argument("--alt-label", default=None, help="消融候选的标签；缺省按消融类型生成")
     ap.add_argument("--backend", choices=["scalar", "sse", "avx2"], default="avx2",
                     help="消融模式下两个变体共用的后端")
+    ap.add_argument("--threads", type=int, default=1, help="基线线程数（两种模式都生效）")
+    ap.add_argument("--alt-threads", type=int, default=None, help="消融模式：对照线程数")
     ap.add_argument("--blocks", type=int, default=2)
     ap.add_argument("--out", default="artifacts/stage2-benchmark.json")
     args = ap.parse_args()
@@ -61,24 +63,38 @@ def main():
         ap.error("--blocks 必须是至少2的偶数，交替使用ABBA/BAAB")
     if bool(args.alt_model) != bool(args.alt_ref):
         ap.error("--alt-model 与 --alt-ref 必须同时给出")
+    for name in ("threads", "alt_threads"):
+        value = getattr(args, name)
+        if value is not None and not 1 <= value <= 1024:
+            ap.error(f"--{name.replace('_', '-')} 需要在 1..1024 内")
+    ablation = bool(args.alt_model or args.alt_threads)
     out = Path(args.out)
     if out.exists():
         ap.error("报告已存在，请用 --out 指定新文件，避免覆盖旧证据")
     image = Path(args.input).resolve()
     alt_binary = args.alt_binary or args.binary
 
-    if args.alt_model:
-        baseline = variant("baseline", args.binary, args.model, args.ref, args.backend)
-        candidate = variant(args.alt_label, alt_binary, args.alt_model, args.alt_ref, args.backend)
-        scope = f"single-machine ablation at backend={args.backend} (binary and/or model), not detector accuracy"
+    if ablation:
+        if args.alt_model:
+            baseline = variant(f"threads{args.threads}", args.binary, args.model, args.ref, args.backend, args.threads)
+            candidate = variant(args.alt_label or "alt", alt_binary, args.alt_model, args.alt_ref, args.backend,
+                                args.alt_threads or args.threads)
+            scope = (f"single-machine ablation at backend={args.backend} (binary and/or model), "
+                     f"threads baseline={baseline['threads']} candidate={candidate['threads']}, not detector accuracy")
+        else:
+            baseline = variant(f"threads{args.threads}", args.binary, args.model, args.ref, args.backend, args.threads)
+            candidate = variant(args.alt_label or f"threads{args.alt_threads}", alt_binary, args.model, args.ref,
+                                args.backend, args.alt_threads)
+            scope = (f"single-machine thread-count ablation at backend={args.backend}, same binary/model/input; "
+                     "not a claim about other machines or about detector accuracy")
     else:
-        baseline = variant("scalar", args.binary, args.model, args.ref, "scalar")
+        baseline = variant("scalar", args.binary, args.model, args.ref, "scalar", args.threads)
         scope = "single-machine CPU backend comparison, not pure SIMD width or detector accuracy"
-    variants = [baseline] if not args.alt_model else [baseline, candidate]
-    if not args.alt_model:
-        variants += [variant(name, args.binary, args.model, args.ref, name) for name in args.candidates]
+    variants = [baseline] if not ablation else [baseline, candidate]
+    if not ablation:
+        variants += [variant(name, args.binary, args.model, args.ref, name, args.threads) for name in args.candidates]
 
-    report = {"schema_version": 2, "created_at": datetime.now(timezone.utc).isoformat(),
+    report = {"schema_version": 3, "created_at": datetime.now(timezone.utc).isoformat(),
               "passed": False, "platform": platform.platform(), "timing": "C++ run internal elapsed milliseconds",
               "scope": scope,
               "ordering": "alternating ABBA/BAAB blocks, fresh process per sample, one warm-up per pair/variant",
@@ -86,6 +102,7 @@ def main():
                               "load averages are observations, not a resource-isolation gate"],
               "verification": {}, "variants": {v["label"]: {"binary": str(v["binary"]), "model": str(v["model"]),
                                                             "ref": str(v["ref"]), "backend": v["backend"],
+                                                            "threads": v["threads"],
                                                             "sha256": v["sha256"]}
                                                for v in variants},
               "pairs": []}
@@ -108,14 +125,16 @@ def main():
         for v in variants:
             if states.get(v["backend"]) != "available":
                 raise ValueError(f"后端不可用: {v['backend']}（变体 {v['label']}）")
-            text = command([v["binary"], "verify", v["model"], v["ref"], "--backend", v["backend"], "--mode", "chained", "--brief"])
+            text = command([v["binary"], "verify", v["model"], v["ref"], "--backend", v["backend"], "--threads",
+                            str(v["threads"]), "--mode", "chained", "--brief"])
             counts = re.search(r"EXACT (\d+) OK (\d+) FAIL (\d+) REF (\d+)", text)
             if not counts or int(counts[3]) or int(counts[4]) or int(counts[1]) + int(counts[2]) == 0:
                 raise ValueError(f"{v['label']} 验证未全部实际执行并通过:\n{text}")
             report["verification"][v["label"]] = text
 
         def sample(v):
-            text = command([v["binary"], "run", v["model"], image, "--backend", v["backend"]])
+            text = command([v["binary"], "run", v["model"], image, "--backend", v["backend"],
+                            "--threads", str(v["threads"])])
             match = re.search(r"整图一次\s+([0-9.]+)\s+ms", text)
             if not match or float(match[1]) <= 0:
                 raise ValueError(f"无法提取 C++ 计时:\n{text}")

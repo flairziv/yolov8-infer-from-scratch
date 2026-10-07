@@ -23,20 +23,33 @@ void usage() {
     std::printf(
         "用法:\n"
         "  yinfer backends\n"
-        "  yinfer info   <模型目录> [--backend scalar|sse|avx2]\n"
-        "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2] [--memory naive|reuse] [--dump-dir 目录]\n"
-        "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2] [--mode isolated|chained] [--tol 1e-4] [--perturb 节点号] [--brief]\n"
+        "  yinfer info   <模型目录> [--backend scalar|sse|avx2] [--threads N]\n"
+        "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2] [--memory naive|reuse] [--threads N] [--dump-dir 目录]\n"
+        "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2] [--mode isolated|chained] [--tol 1e-4] [--threads N] [--perturb 节点号] [--brief]\n"
         "\n"
         "verify 的两种模式:\n"
         "  isolated  每个节点都从参考数据取输入，只量这一层自己引入的误差（默认）\n"
         "  chained   节点吃前面节点自己算出的结果，误差一路累积，量的是端到端误差\n"
         "还没实现的算子直接用参考数据顶上（状态 REF），所以任何阶段都能把整张图走完\n"
+        "--threads N  算子内部数据并行（默认 1）。工作单元彼此独立，任意线程数的输出与单线程逐位一致\n"
         "--perturb N  执行完第 N 个节点后故意改坏它的输出，用来确认对拍工具真能抓到错\n"
         "--brief      不打印 REF 行\n"
         "--memory naive|reuse  验证时选择内存规划，默认 reuse（不是原地算子）\n");
 }
 
 double mib(size_t bytes) { return bytes / 1024.0 / 1024.0; }
+
+int parse_threads(const std::string& v) {
+    size_t pos = 0;
+    int threads = 0;
+    try {
+        threads = std::stoi(v, &pos);
+    } catch (const std::exception&) {
+        YI_CHECK(false, "--threads 不是整数: " << v);
+    }
+    YI_CHECK(pos == v.size() && threads >= 1 && threads <= 1024, "--threads 需要是 1..1024 的整数，收到 " << v);
+    return threads;
+}
 
 void print_missing(const Executor& ex) {
     const auto miss = ex.missing_kernels();
@@ -50,13 +63,13 @@ void print_missing(const Executor& ex) {
 }
 
 void print_backend(const Executor& ex) {
-    std::printf("backend=%s workspace_bytes=%zu simd_nodes=%zu fallback_nodes=%zu\n",
-                backend_name(ex.backend()), ex.workspace_bytes(), ex.simd_nodes(), ex.fallback_nodes());
+    std::printf("backend=%s threads=%d workspace_bytes=%zu simd_nodes=%zu fallback_nodes=%zu\n",
+                backend_name(ex.backend()), ex.threads(), ex.workspace_bytes(), ex.simd_nodes(), ex.fallback_nodes());
 }
 
-int cmd_info(const std::string& model_dir, Backend backend) {
+int cmd_info(const std::string& model_dir, Backend backend, int threads) {
     Model m = Model::load(model_dir);
-    Executor ex(m, true, backend);
+    Executor ex(m, true, backend, threads);
     print_backend(ex);
     std::map<std::string, int> ops;
     for (const Node& n : m.nodes) ++ops[n.op];
@@ -100,9 +113,9 @@ void dump_outputs(const Model& model, const std::string& dir) {
 }
 
 int cmd_run(const std::string& model_dir, const std::string& input_path,
-            Backend backend, bool reuse, const std::string& dump_dir) {
+            Backend backend, bool reuse, int threads, const std::string& dump_dir) {
     Model m = Model::load(model_dir);
-    Executor ex(m, reuse, backend);
+    Executor ex(m, reuse, backend, threads);
     print_backend(ex);
     if (!ex.missing_kernels().empty()) {
         std::printf("整图还跑不了（可以先用 yinfer verify 对拍已经实现的部分）\n");
@@ -138,6 +151,7 @@ struct VerifyOptions {
     bool brief = false;
     bool reuse = true;
     Backend backend = Backend::Scalar;
+    int threads = 1;
 };
 
 // 把输出里绝对值最大的元素加上它自己的 1%：故意制造一个错误，确认对拍工具真的抓得到（验证"验证器"本身）
@@ -154,7 +168,7 @@ void perturb(Tensor& t) {
 
 int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const VerifyOptions& opt) {
     Model m = Model::load(model_dir);
-    Executor ex(m, opt.reuse, opt.backend);
+    Executor ex(m, opt.reuse, opt.backend, opt.threads);
     print_backend(ex);
     const Reference ref = Reference::load(ref_dir);
     for (const Tensor& t : m.tensors) {                     // 每个激活都要有参考数据，并且形状一致
@@ -241,15 +255,21 @@ int main(int argc, char** argv) {
         const std::string cmd = argv[1];
         if (cmd == "info") {
             Backend backend = Backend::Scalar;
+            int threads = 1;
             for (int i = 3; i < argc; ++i) {
-                YI_CHECK(std::string(argv[i]) == "--backend" && i + 1 < argc, "info 只接受 --backend 参数");
-                backend = parse_backend(argv[++i]);
+                const std::string a = argv[i];
+                YI_CHECK(i + 1 < argc, a << " 后面缺参数");
+                const std::string v = argv[++i];
+                if (a == "--backend") backend = parse_backend(v);
+                else if (a == "--threads") threads = parse_threads(v);
+                else YI_CHECK(false, "info 只接受 --backend 与 --threads 参数");
             }
-            return cmd_info(argv[2], backend);
+            return cmd_info(argv[2], backend, threads);
         }
         if (cmd == "run" && argc >= 4) {
             Backend backend = Backend::Scalar;
             bool reuse = true;
+            int threads = 1;
             std::string dump_dir;
             for (int i = 4; i < argc; ++i) {
                 const std::string a = argv[i];
@@ -257,12 +277,13 @@ int main(int argc, char** argv) {
                 const std::string v = argv[++i];
                 if (a == "--backend") backend = parse_backend(v);
                 else if (a == "--dump-dir") dump_dir = v;
+                else if (a == "--threads") threads = parse_threads(v);
                 else if (a == "--memory") {
                     YI_CHECK(v == "naive" || v == "reuse", "--memory 只能是 naive 或 reuse");
                     reuse = v == "reuse";
                 } else YI_CHECK(false, "run 不认识参数 " << a);
             }
-            return cmd_run(argv[2], argv[3], backend, reuse, dump_dir);
+            return cmd_run(argv[2], argv[3], backend, reuse, threads, dump_dir);
         }
         if (cmd == "verify" && argc >= 4) {
             VerifyOptions opt;
@@ -282,6 +303,8 @@ int main(int argc, char** argv) {
                     const std::string v = value();
                     YI_CHECK(v == "naive" || v == "reuse", "--memory 只能是 naive 或 reuse");
                     opt.reuse = v == "reuse";
+                } else if (a == "--threads") {
+                    opt.threads = parse_threads(value());
                 } else if (a == "--tol") {
                     opt.tol = std::stod(value());
                 } else if (a == "--perturb") {

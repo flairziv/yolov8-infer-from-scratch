@@ -67,7 +67,7 @@ def main():
         value = getattr(args, name)
         if value is not None and not 1 <= value <= 1024:
             ap.error(f"--{name.replace('_', '-')} 需要在 1..1024 内")
-    ablation = bool(args.alt_model or args.alt_threads)
+    ablation = bool(args.alt_model or args.alt_threads or args.alt_binary)
     out = Path(args.out)
     if out.exists():
         ap.error("报告已存在，请用 --out 指定新文件，避免覆盖旧证据")
@@ -75,18 +75,18 @@ def main():
     alt_binary = args.alt_binary or args.binary
 
     if ablation:
-        if args.alt_model:
-            baseline = variant(f"threads{args.threads}", args.binary, args.model, args.ref, args.backend, args.threads)
-            candidate = variant(args.alt_label or "alt", alt_binary, args.alt_model, args.alt_ref, args.backend,
-                                args.alt_threads or args.threads)
-            scope = (f"single-machine ablation at backend={args.backend} (binary and/or model), "
-                     f"threads baseline={baseline['threads']} candidate={candidate['threads']}, not detector accuracy")
-        else:
-            baseline = variant(f"threads{args.threads}", args.binary, args.model, args.ref, args.backend, args.threads)
-            candidate = variant(args.alt_label or f"threads{args.alt_threads}", alt_binary, args.model, args.ref,
-                                args.backend, args.alt_threads)
-            scope = (f"single-machine thread-count ablation at backend={args.backend}, same binary/model/input; "
-                     "not a claim about other machines or about detector accuracy")
+        # 线程数是唯一消融轴时用 threadsN 标签；其余情况用 baseline/候选标签。
+        threads_only = bool(args.alt_threads) and not args.alt_model and not args.alt_binary
+        baseline = variant(f"threads{args.threads}" if threads_only else "baseline",
+                           args.binary, args.model, args.ref, args.backend, args.threads)
+        candidate = variant(args.alt_label or (f"threads{args.alt_threads}" if threads_only else "alt"),
+                            alt_binary, args.alt_model or args.model, args.alt_ref or args.ref, args.backend,
+                            args.alt_threads or args.threads)
+        axes = [name for name, value in (("binary", args.alt_binary), ("model", args.alt_model),
+                                         ("threads", args.alt_threads)) if value]
+        scope = (f"single-machine {'+'.join(axes)} ablation at backend={args.backend}, "
+                 f"baseline threads={baseline['threads']} candidate threads={candidate['threads']}, "
+                 "same input image; not a claim about detector accuracy")
     else:
         baseline = variant("scalar", args.binary, args.model, args.ref, "scalar", args.threads)
         scope = "single-machine CPU backend comparison, not pure SIMD width or detector accuracy"

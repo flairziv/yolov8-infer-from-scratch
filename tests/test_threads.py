@@ -89,9 +89,10 @@ class ThreadsTest(unittest.TestCase):
                     np.testing.assert_array_equal(single.view(np.uint32), many.view(np.uint32))
 
     def test_workspace_grows_with_threads(self):
-        simd = [b for b in self.backends if b != "scalar"]
+        # 只有 CPU SIMD 后端有主机侧打包面板；CUDA 的工作区在显存里、主机 workspace_bytes 恒为 0。
+        simd = [b for b in self.backends if b in ("sse", "avx2")]
         if not simd:
-            self.skipTest("没有可用的 SIMD 后端")
+            self.skipTest("没有可用的 CPU SIMD 后端")
         with tempfile.TemporaryDirectory(prefix="yinfer-threads-") as tmp:
             root = Path(tmp)
             write_model(root)

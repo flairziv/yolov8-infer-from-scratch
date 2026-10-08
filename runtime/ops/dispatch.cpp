@@ -7,11 +7,18 @@ namespace yi {
 KernelFn find_sse_kernel(const std::string& op);
 KernelFn find_avx2_kernel(const std::string& op);
 #endif
+// CUDA 未启用时由 stub 提供，永远返回 nullptr。
+KernelFn find_cuda_kernel(const std::string& op);
 
 KernelSelection select_kernel(const Node& node, const std::vector<Tensor>& tensors, Backend backend) {
     require_backend(backend);
     const KernelFn scalar = find_kernel(node.op);
     if (backend == Backend::Scalar) return {scalar, false};
+    if (backend == Backend::CUDA) {
+        const KernelFn cuda = find_cuda_kernel(node.op);
+        // 没有 CUDA 实现就是真的缺失（不像 CPU 那样退回标量：数据在显存里，CPU 算子读不到）。
+        return {cuda, cuda != nullptr};
+    }
 #if defined(YI_X86_SIMD)
     const int lanes = backend == Backend::SSE ? 4 : 8;
     // 没有完整向量组的简单算子直接使用标量版，诊断里计为回退。
@@ -37,7 +44,7 @@ KernelSelection select_kernel(const Node& node, const std::vector<Tensor>& tenso
 size_t kernel_workspace_bytes(const Node& node, const std::vector<Tensor>& tensors, Backend backend, int threads) {
     require_backend(backend);
     YI_CHECK(threads >= 1, "线程数至少是 1");
-    if (backend == Backend::Scalar || node.op != "Conv") return 0;
+    if (backend == Backend::Scalar || backend == Backend::CUDA || node.op != "Conv") return 0;
     return detail::conv_workspace(node, tensors, backend == Backend::SSE ? 8 : 16, threads);
 }
 

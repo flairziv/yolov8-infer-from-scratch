@@ -84,7 +84,9 @@ void check_backend(Backend backend) {
             YI_CHECK(std::fabs(b.data[i] - expected.data[i]) <= 1e-5f + 1e-4f * std::fabs(expected.data[i]),
                      "SIMD 与标量逐元素误差超限");
         }
-        reused.run(); // 不再 set_input，复用同一输入和 workspace。
+        // 契约：图输入的槽位在最后一次被读之后可以被后续激活复用，所以每次 run 之前都要重新 set_input。
+        reused.set_input(0, input.data());
+        reused.run();
         YI_CHECK(std::memcmp(a.data, b.data, a.bytes()) == 0, "重复执行改变了输出");
         YI_CHECK(reused.workspace_bytes() == workspace, "执行期间工作区大小变化");
     }

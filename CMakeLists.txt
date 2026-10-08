@@ -53,7 +53,7 @@ if(YI_ENABLE_X86_SIMD AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$
   set_source_files_properties(runtime/ops/avx2_ops.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 
-add_executable(yinfer tools/yinfer.cpp tools/reference.cpp)
+add_executable(yinfer tools/yinfer.cpp tools/reference.cpp tools/postprocess.cpp)
 target_link_libraries(yinfer PRIVATE yinfer_core)
 
 include(CTest)
@@ -64,4 +64,8 @@ if(BUILD_TESTING)
   add_executable(test_simd_runtime tests/test_simd_runtime.cpp)
   target_link_libraries(test_simd_runtime PRIVATE yinfer_core)
   add_test(NAME simd_runtime COMMAND test_simd_runtime)
+  add_executable(test_postprocess tests/test_postprocess.cpp tools/postprocess.cpp)
+  target_include_directories(test_postprocess PRIVATE tools)
+  target_link_libraries(test_postprocess PRIVATE yinfer_core)
+  add_test(NAME postprocess COMMAND test_postprocess)
 endif()

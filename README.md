@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 3.1–3.5**：卷积形状特化、Conv+SiLU 收尾融合、多线程（任意线程数输出与单线程逐位一致）、第二次内存优化（Split 视图、输入解钉、原地覆盖）与检测后处理（DFL 解码 + 类内 NMS + letterbox 反算，能画框）。激活 arena 从 18.75 降到 10.94 MiB；bus.jpg 与 zidane.jpg 的检测框与 Ultralytics 在**同一 letterbox 几何**下逐框 IoU ≥ 0.9998。
+**当前完成阶段 4**：CPU 侧完成卷积形状特化、Conv+SiLU 收尾融合、多线程（任意线程数输出与单线程逐位一致）、第二次内存优化（arena 18.75 → 10.94 MiB）与检测后处理（与 Ultralytics 同几何逐框 IoU ≥ 0.9998）；CUDA 后端把激活与权重放进显存，朴素直接卷积 → 共享内存分块 2.43×，热身后比 AVX2 4 线程快 2.94×（RTX 4060 Laptop，同机交错对照）。
 
 ## 进度
 
@@ -11,9 +11,9 @@
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
-| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | **完成** |
-| 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
-| 5 | 可选：INT8 卷积 / ARM NEON 移植 | 待实现 |
+| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 完成 |
+| 4 | CUDA 后端：显存 arena、七种算子、直接卷积的共享内存与寄存器分块 | **完成** |
+| 5 | 可选：INT8 卷积 / ARM NEON 移植 / 算子切分与串联部署 | 待定 |
 
 ## 整体结构
 
@@ -26,8 +26,9 @@ Python 前端 frontend/（离线跑一次）
              ──make_reference.py──▶ artifacts/ref/input.bin + ref.bin + ref.txt
 
 C++ 运行时 runtime/（不依赖推理库）
-  Model::load 解析模型、权重整块读入 → 内存规划 → Executor 按拓扑序逐个调用算子
-  tools/yinfer：info（模型概况）/ run（子图独立执行）/ verify（逐层对拍）
+  Model::load 解析模型、权重整块读入 → 内存规划（生命周期复用、Split 视图、原地覆盖）→ Executor 按拓扑序逐个调用算子
+  后端：scalar / sse / avx2（可多线程）/ cuda（激活与权重在显存，主机影子回读）
+  tools/yinfer：info（模型概况）/ run（整图执行）/ verify（逐层对拍）/ detect（DFL + NMS，输出检测框）
 ```
 
 前端导出的目标子图位于检测头 DFL 解码之前：95 个节点、7 种算子，输出 3 个尺度各一个框分支（64 通道）和类别分支（80 通道）。57 个卷积带 `act=1`，SiLU 收尾已融进卷积。DFL 解码、sigmoid、坐标变换和 NMS 在 C++ 后处理里实现（`tools/postprocess.cpp` + `yinfer detect`，见阶段 3.5）；这种拆分思路也常用于 NPU 部署，但具体支持范围取决于工具链和版本。
@@ -69,6 +70,14 @@ AddressSanitizer + UBSan 检查：
 BUILD_DIR=build-asan bash scripts/build.sh -DYI_SANITIZE=ON
 YINFER_BIN=build-asan/yinfer python3 -m unittest discover -s tests -v
 ./build-asan/yinfer verify artifacts/model artifacts/ref --mode chained
+```
+
+CUDA 后端（可选，需要 NVIDIA 设备与 CUDA 工具链；默认构建不带 CUDA，`yinfer backends` 会报 `cuda unavailable`）：
+
+```bash
+bash scripts/build_cuda.sh                       # -DYI_ENABLE_CUDA=ON，nvcc 取 /usr/local/cuda-12.6，目标 sm_89
+./build-cuda/yinfer verify artifacts/model artifacts/ref --backend cuda --mode chained
+./build-cuda/yinfer run artifacts/model artifacts/ref/input.bin --backend cuda --repeat 10
 ```
 
 `tests/test_verify_nonfinite.py` 只依赖 Python 标准库；`tests/test_ref_ops.py` 额外需要 numpy、onnx、onnxruntime。测试覆盖有限值逐位相同，以及相同比特的 NaN、正无穷和负无穷；非有限值必须判为失败，不能因为比特相同就判通过。
@@ -119,6 +128,51 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 未实现算子会标记 REF 并使用参考输出，**不能据此宣称整网通过**；误差传播也会被 REF 节点截断。
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
+
+### 阶段 4：CUDA 后端
+
+- **构建**：`bash scripts/build_cuda.sh`（`-DYI_ENABLE_CUDA=ON`，nvcc 取 `/usr/local/cuda-12.6`，目标架构 `sm_89`，换卡改 `CMAKE_CUDA_ARCHITECTURES`）。不带 CUDA 的构建链接 stub：`backend_available(CUDA)` 返回 false，`yinfer backends` 打印 `cuda unavailable`，请求 `--backend cuda` 直接报错，不冒充支持。
+- **结构**：`runtime/cuda/cuda_api.{h,cu}`（设备初始化、显存分配、H2D/D2H 拷贝、同步，所有 CUDA 错误转异常）、`runtime/cuda/cuda_ops.cu`（七种算子的 kernel 与注册表，`YI_ENABLE_CUDA=OFF` 时由 stub 提供空注册表）。
+- **执行器**：CUDA 路径下**激活 arena 与权重整体放显存**（沿用同一份内存规划，Split 视图与原地覆盖照旧生效——视图的设备指针就是父张量的切片地址）；主机侧保留同布局的影子缓冲，`host_ptr(id)` 按张量 D2H 回读、`set_tensor/push_tensor` 写回；`run()` 末尾 `cudaDeviceSynchronize`，所以计时是真实的 GPU 时间而不是提交时间。
+- **卷积两版**（累加顺序相同，输出逐位一致；`YI_CUDA_CONV=naive` 切换做消融）：
+  - 朴素直接卷积：一线程一个输出点，逐 `ci/kh/kw` 累加，无 im2col、无共享内存。
+  - 分块版：一个 block 负责 16×16 输出像素 × 8 个输出通道——输入 patch（含 halo）每个输入通道只从全局内存读一次进共享内存，8 个通道的累加器在寄存器里（输入值复用 8 次），本通道的权重也先放共享内存做块内广播。patch 放不进静态共享内存（stride>2 或 kernel>3）时自动回退朴素版。
+
+验证（`rel <= 1e-4` 沿用，未放宽；GPU 与 CPU 的加法顺序不同，**不承诺逐位一致**）：
+
+| 门禁 | 结果 |
+|---|---|
+| 4 组对拍（bus/zidane × isolated/chained） | 全部 `FAIL=0、REF=0`，最大 rel 1.22e-5；isolated EXACT/OK 46/57（与 avx2 相同） |
+| 分块 vs 朴素卷积六路输出 | `cmp` 逐位相同（12/12 文件） |
+| 检测框（CUDA vs CPU，同输入同阈值） | 5 个框全同，分数一致到 6 位小数 |
+| `test_cuda_runtime` | 七种算子、显存上的视图与原地、主机回读，与标量后端 rel ~1e-7；没有 CUDA 的构建打印 SKIP |
+| 测试矩阵 | CPU 构建、ASan/UBSan 构建、CUDA 构建下：4 个 CTest 目标与 58 个 Python 测试全部通过 |
+
+同机交错计时（ABBA/BAAB × 4 块，每变体 8 个采样，fresh process，`--repeat 10` 取热身后 9 次的中位数）：
+
+| 对照 | 基线中位数 | 候选中位数 | 之比 |
+|---|---:|---:|---:|
+| avx2×4 线程 → cuda（分块） | 43.09 ms | 14.66 ms | **2.94×** |
+| cuda 朴素 → cuda 分块 | 35.39 ms | 14.56 ms | **2.43×** |
+| avx2×4 线程 → cuda 朴素（每进程首次执行，冷） | 42.78 ms | 41.70 ms | 1.02 |
+
+- **冷启动值得单列**：每进程第一次执行包含 CUDA 模块加载等一次性开销，朴素 GPU 版冷启动时与 CPU 打平（1.02）——只看冷启动会得出"GPU 没用"的错误结论。这也是 `run` 加 `--repeat` 的原因：报告同时记录 `cold_ms` 与热身后的中位数。
+- 分块的收益来自访存：朴素版每个输出点都要重新读 `Cin×Kh×Kw` 个输入，分块版把输入 patch 在共享内存里复用、并用 8 个寄存器累加器把每次读入的输入值复用 8 次。
+- 报告：`artifacts/stage4-cuda-vs-avx2-warm.json`（SHA256 `4be88363f9f5acb0b6361343dc2aab75566816001ea4576c2b9fcbd80dc8992c`）、`artifacts/stage4-conv-tiled-vs-naive.json`（`6ebc6c39678de879396f692c6d7c301c0407dcb0a1881b8e243460fc6cf0d9bc`）、冷启动对照 `artifacts/stage4-cuda-vs-avx2.json`（`4d8225ac0de753b74c13b0ebe739aca4d6d8a4362f4de9d3e7b3af1d5588d732`）。
+
+边界与限制：单卡 RTX 4060 Laptop 8GB（sm_89）、WSL2、CUDA 12.6；FP32、单流顺序执行、每节点一次 kernel 启动；Conv 是直接卷积（朴素/共享内存分块），没有用 im2col+cuBLAS，也没有 Tensor Core、INT8 或 cuDNN；Concat/Split/Upsample 是朴素 kernel。14.7 ms 这个数字**不是** TensorRT 级别的性能，不与 TensorRT/ORT-GPU 做比较。
+
+```bash
+bash scripts/build_cuda.sh
+./build-cuda/yinfer backends
+./build-cuda/yinfer verify artifacts/model artifacts/ref --backend cuda --mode chained
+./build-cuda/yinfer detect artifacts/model artifacts/ref/input.bin --backend cuda --conf 0.25 --iou 0.7
+ctest --test-dir build-cuda --output-on-failure
+# 消融：基线 = 分块卷积，候选 = 朴素卷积（YI_CUDA_CONV=naive）
+python3 scripts/benchmark_backends.py --binary build-cuda/yinfer --backend cuda \
+    --alt-env YI_CUDA_CONV=naive --alt-label naive --blocks 4 --repeat 10 \
+    --out artifacts/stage4-conv-tiled-vs-naive.json
+```
 
 ### 阶段 3.5：检测后处理（能画框）
 
@@ -443,11 +497,11 @@ ctest --test-dir build-asan --output-on-failure
 
 ```
 frontend/   Python 前端：导出、图优化、编译成运行时格式、生成参考数据
-runtime/    C++ 运行时：模型加载、内存规划、执行器、标量与 SSE/AVX2 算子
-tools/      命令行工具 yinfer 与参考数据读取
-tests/      小型 ONNX 算子对拍与验证器回归测试
-scripts/    prepare.sh（Python 前端）、build.sh（CMake 编译）
-artifacts/  权重、ONNX、模型文件、参考数据和本地验证日志，不进版本库
+runtime/    C++ 运行时：模型加载、内存规划、线程池、执行器、标量与 SSE/AVX2 算子；cuda/ 为 CUDA 后端（含无 CUDA 时的 stub）
+tools/      命令行工具 yinfer、参考数据读取、检测后处理（DFL/NMS）
+tests/      小型 ONNX 算子对拍、验证器回归、多线程/内存/后处理/CUDA 的 C++ 与 Python 测试
+scripts/    prepare.sh（Python 前端）、build.sh / build_cuda.sh（CMake 编译）、benchmark_backends.py（同机交错基准）、detect.py（画框与对照）
+artifacts/  权重、ONNX、模型文件、参考数据、基准报告和本地验证日志，不进版本库
 ```
 
 ## 许可

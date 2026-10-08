@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "cuda/cuda_api.h"
 #include "executor.h"
 #include "postprocess.h"
 #include "reference.h"
@@ -25,10 +26,10 @@ void usage() {
     std::printf(
         "用法:\n"
         "  yinfer backends\n"
-        "  yinfer info   <模型目录> [--backend scalar|sse|avx2] [--threads N]\n"
-        "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2] [--memory naive|reuse] [--threads N] [--dump-dir 目录]\n"
-        "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2] [--mode isolated|chained] [--tol 1e-4] [--threads N] [--perturb 节点号] [--brief]\n"
-        "  yinfer detect <模型目录> <input.bin> [--conf 0.25] [--iou 0.7] [--backend scalar|sse|avx2] [--threads N] [--letterbox 缩放,左右填充,上下填充] [--out 文件]\n"
+        "  yinfer info   <模型目录> [--backend scalar|sse|avx2|cuda] [--threads N]\n"
+        "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2|cuda] [--memory naive|reuse] [--threads N] [--repeat N] [--dump-dir 目录]\n"
+        "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2|cuda] [--mode isolated|chained] [--tol 1e-4] [--threads N] [--perturb 节点号] [--brief]\n"
+        "  yinfer detect <模型目录> <input.bin> [--conf 0.25] [--iou 0.7] [--backend scalar|sse|avx2|cuda] [--threads N] [--letterbox 缩放,左右填充,上下填充] [--out 文件]\n"
         "\n"
         "verify 的两种模式:\n"
         "  isolated  每个节点都从参考数据取输入，只量这一层自己引入的误差（默认）\n"
@@ -94,6 +95,7 @@ void print_backend(const Executor& ex) {
     std::printf("backend=%s threads=%d workspace_bytes=%zu simd_nodes=%zu fallback_nodes=%zu views=%zu in_place=%zu\n",
                 backend_name(ex.backend()), ex.threads(), ex.workspace_bytes(), ex.simd_nodes(), ex.fallback_nodes(),
                 ex.view_tensors(), ex.in_place_tensors());
+    if (ex.backend() == Backend::CUDA) std::printf("device=%s arena_bytes=%zu\n", cuda::device_name(), ex.arena_bytes());
 }
 
 int cmd_info(const std::string& model_dir, Backend backend, int threads) {
@@ -124,15 +126,16 @@ int cmd_info(const std::string& model_dir, Backend backend, int threads) {
     return 0;
 }
 
-void dump_outputs(const Model& model, const std::string& dir) {
+void dump_outputs(Executor& ex, Model& model, const std::string& dir) {
     std::filesystem::create_directories(dir);
     std::ofstream index(std::filesystem::path(dir) / "outputs.txt");
     YI_CHECK(index, "无法创建输出索引 " << dir);
     for (size_t i = 0; i < model.outputs.size(); ++i) {
         const Tensor& t = model.tensors[model.outputs[i]];
+        const float* data = ex.host_ptr(static_cast<size_t>(model.outputs[i]));
         const std::string file = "output" + std::to_string(i) + ".bin";
         std::ofstream out(std::filesystem::path(dir) / file, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(t.data), static_cast<std::streamsize>(t.bytes()));
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(t.bytes()));
         YI_CHECK(out, "输出文件写入失败 " << file);
         index << file << " " << t.name << " ";
         for (size_t d = 0; d < t.shape.size(); ++d) index << (d ? "," : "") << t.shape[d];
@@ -142,7 +145,7 @@ void dump_outputs(const Model& model, const std::string& dir) {
 }
 
 int cmd_run(const std::string& model_dir, const std::string& input_path,
-            Backend backend, bool reuse, int threads, const std::string& dump_dir) {
+            Backend backend, bool reuse, int threads, int repeat, const std::string& dump_dir) {
     Model m = Model::load(model_dir);
     Executor ex(m, reuse, backend, threads);
     print_backend(ex);
@@ -154,22 +157,34 @@ int cmd_run(const std::string& model_dir, const std::string& input_path,
     YI_CHECK(m.inputs.size() == 1, "run 命令当前只接受一个图输入");
     const Tensor& in = m.tensors[m.inputs[0]];
     const AlignedBuffer x = read_file(input_path, static_cast<int64_t>(in.bytes()));
-    ex.set_input(0, x.as<float>());
-    const auto t0 = std::chrono::steady_clock::now();
-    ex.run();
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::vector<double> times;
+    for (int r = 0; r < repeat; ++r) {
+        ex.set_input(0, x.as<float>());   // 每次 run 前重新设置输入（输入槽位可能已被复用）
+        const auto t0 = std::chrono::steady_clock::now();
+        ex.run();
+        times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     for (int i : m.outputs) {
         const Tensor& t = m.tensors[i];
+        const float* data = ex.host_ptr(static_cast<size_t>(i));
         double lo = INFINITY, hi = -INFINITY, sum = 0;
         for (int64_t k = 0; k < t.numel(); ++k) {
-            lo = std::fmin(lo, t.data[k]);
-            hi = std::fmax(hi, t.data[k]);
-            sum += t.data[k];
+            lo = std::fmin(lo, data[k]);
+            hi = std::fmax(hi, data[k]);
+            sum += data[k];
         }
         std::printf("  %-14s min %9.4f  max %9.4f  mean %9.4f  %s\n", t.shape_str().c_str(), lo, hi, sum / t.numel(), t.name.c_str());
     }
-    std::printf("整图一次 %.6f ms（单次，含冷启动）\n", ms);
-    if (!dump_dir.empty()) dump_outputs(m, dump_dir);
+    std::printf("整图一次 %.6f ms（单次，含冷启动）\n", times[0]);
+    if (repeat > 1) {
+        // 去掉第一次（冷启动：缓存、页映射、CUDA 模块加载），报告其余各次的中位数与最小值。
+        std::vector<double> warm(times.begin() + 1, times.end());
+        std::sort(warm.begin(), warm.end());
+        const double median = warm.size() % 2 ? warm[warm.size() / 2]
+                                              : 0.5 * (warm[warm.size() / 2 - 1] + warm[warm.size() / 2]);
+        std::printf("热身后 %zu 次中位数 %.6f ms（最小 %.6f ms）\n", warm.size(), median, warm.front());
+    }
+    if (!dump_dir.empty()) dump_outputs(ex, m, dump_dir);
     return 0;
 }
 
@@ -183,16 +198,19 @@ struct VerifyOptions {
     int threads = 1;
 };
 
-// 把输出里绝对值最大的元素加上它自己的 1%：故意制造一个错误，确认对拍工具真的抓得到（验证"验证器"本身）
-void perturb(Tensor& t) {
+// 把输出里绝对值最大的元素加上它自己的 1%：故意制造一个错误，确认对拍工具真的抓得到（验证"验证器"本身）。
+// 通过执行器读写，CUDA 后端下也会正确写进显存。
+void perturb(Executor& ex, Tensor& t, size_t id) {
+    float* data = ex.host_ptr(id);
     int64_t k = 0;
     float mx = 0;
     for (int64_t i = 0; i < t.numel(); ++i)
-        if (std::fabs(t.data[i]) > mx) {
-            mx = std::fabs(t.data[i]);
+        if (std::fabs(data[i]) > mx) {
+            mx = std::fabs(data[i]);
             k = i;
         }
-    t.data[k] += 0.01f * (mx > 0 ? mx : 1.0f);
+    data[k] += 0.01f * (mx > 0 ? mx : 1.0f);
+    ex.push_tensor(id);
 }
 
 int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const VerifyOptions& opt) {
@@ -206,10 +224,7 @@ int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const V
         YI_CHECK(e.shape == t.shape_str(), t.name << " 的形状：模型里 " << t.shape_str() << "，参考数据里 " << e.shape);
     }
     for (size_t k = 0; k < m.inputs.size(); ++k) ex.set_input(k, ref.at(m.tensors[m.inputs[k]].name).data);
-    auto load_ref = [&](int ti) {
-        Tensor& t = m.tensors[ti];
-        std::memcpy(t.data, ref.at(t.name).data, t.bytes());
-    };
+    auto load_ref = [&](int ti) { ex.set_tensor(static_cast<size_t>(ti), ref.at(m.tensors[ti].name).data); };
 
     std::printf("激活内存：%s %.2f MiB\n", opt.reuse ? "reuse" : "naive", mib(ex.arena_bytes()));
     std::printf("逐层对拍：%s，通过标准 rel = max|d| / max|ref| <= %.0e\n",
@@ -229,7 +244,7 @@ int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const V
         else
             for (int to : n.outputs) load_ref(to);          // 没实现：用参考数据顶上，让后面的节点照常执行
         const bool perturbed = static_cast<long>(i) == opt.perturb;
-        if (perturbed) perturb(m.tensors[n.outputs[0]]);
+        if (perturbed) perturb(ex, m.tensors[n.outputs[0]], static_cast<size_t>(n.outputs[0]));
 
         for (size_t k = 0; k < n.outputs.size(); ++k) {
             const Tensor& t = m.tensors[n.outputs[k]];
@@ -242,7 +257,7 @@ int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const V
                                 "REF", "-", "-", "-", "-", t.name.c_str());
                 continue;
             }
-            const Diff d = compare(t.data, ref.at(t.name).data, t.numel());
+            const Diff d = compare(ex.host_ptr(static_cast<size_t>(n.outputs[k])), ref.at(t.name).data, t.numel());
             // 即使逐位相同，NaN/Inf 也不能作为数值验证通过的依据。
             const char* status = "FAIL";
             if (d.finite) {
@@ -295,7 +310,7 @@ int cmd_detect(const std::string& model_dir, const std::string& input_path, cons
     ex.run();
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-    const auto decoded = dfl_decode(m, opt.conf);
+    const auto decoded = dfl_decode(m, opt.conf, [&](int id) { return ex.host_ptr(static_cast<size_t>(id)); });
     const size_t decoded_count = decoded.size();
     auto boxes = nms(decoded, opt.iou);
     if (opt.letterbox) unletterbox(boxes, opt.scale, opt.pad_x, opt.pad_y);
@@ -321,7 +336,7 @@ int cmd_detect(const std::string& model_dir, const std::string& input_path, cons
 
 int main(int argc, char** argv) {    try {
         if (argc == 2 && std::string(argv[1]) == "backends") {
-            for (Backend b : {Backend::Scalar, Backend::SSE, Backend::AVX2})
+            for (Backend b : {Backend::Scalar, Backend::SSE, Backend::AVX2, Backend::CUDA})
                 std::printf("%s %s\n", backend_name(b), backend_available(b) ? "available" : "unavailable");
             return 0;
         }
@@ -347,6 +362,7 @@ int main(int argc, char** argv) {    try {
             Backend backend = Backend::Scalar;
             bool reuse = true;
             int threads = 1;
+            int repeat = 1;
             std::string dump_dir;
             for (int i = 4; i < argc; ++i) {
                 const std::string a = argv[i];
@@ -355,12 +371,16 @@ int main(int argc, char** argv) {    try {
                 if (a == "--backend") backend = parse_backend(v);
                 else if (a == "--dump-dir") dump_dir = v;
                 else if (a == "--threads") threads = parse_threads(v);
+                else if (a == "--repeat") {
+                    repeat = parse_threads(v);
+                    YI_CHECK(repeat <= 10000, "--repeat 最多 10000");
+                }
                 else if (a == "--memory") {
                     YI_CHECK(v == "naive" || v == "reuse", "--memory 只能是 naive 或 reuse");
                     reuse = v == "reuse";
                 } else YI_CHECK(false, "run 不认识参数 " << a);
             }
-            return cmd_run(argv[2], argv[3], backend, reuse, threads, dump_dir);
+            return cmd_run(argv[2], argv[3], backend, reuse, threads, repeat, dump_dir);
         }
         if (cmd == "verify" && argc >= 4) {
             VerifyOptions opt;

@@ -76,10 +76,11 @@ float iou(const Detection& a, const Detection& b) {
 
 }  // namespace
 
-std::vector<Detection> dfl_decode(const Model& model, float conf) {
+std::vector<Detection> dfl_decode(const Model& model, float conf, const HostTensorPtr& host) {
     YI_CHECK(conf >= 0.0f && conf <= 1.0f, "--conf 需要在 0..1 内");
     int64_t reg_max = 0, classes = 0;
     const auto branches = pair_branches(model, reg_max, classes);
+    const auto data_of = [&](int id) { return host ? host(id) : model.tensors[id].data; };
     // 输入图边长决定步长：stride = 输入边长 / 该尺度的特征图边长。
     YI_CHECK(model.inputs.size() == 1, "检测头解码目前只接受单个图输入");
     const Tensor& in = model.tensors[model.inputs[0]];
@@ -88,8 +89,8 @@ std::vector<Detection> dfl_decode(const Model& model, float conf) {
 
     std::vector<Detection> boxes;
     for (const Branch& b : branches) {
-        const Tensor& box = model.tensors[b.box];
-        const Tensor& cls = model.tensors[b.cls];
+        const float* box_data = data_of(b.box);
+        const float* cls_data = data_of(b.cls);
         YI_CHECK(input_side % b.height == 0 && input_side % b.width == 0, "特征图边长不整除输入边长");
         const float st_h = static_cast<float>(input_side) / static_cast<float>(b.height);
         const float st_w = static_cast<float>(input_side) / static_cast<float>(b.width);
@@ -102,15 +103,15 @@ std::vector<Detection> dfl_decode(const Model& model, float conf) {
                 int best = 0;
                 float best_score = -1.0f;
                 for (int64_t c = 0; c < classes; ++c) {
-                    const float s = sigmoid(cls.data[c * plane + pos]);
+                    const float s = sigmoid(cls_data[c * plane + pos]);
                     if (s > best_score) { best_score = s; best = static_cast<int>(c); }
                 }
                 if (best_score < conf) continue;
                 // 框分支：4 组 reg_max 个 bin，DFL 期望得到 left/top/right/bottom 距离。
-                const float left = dfl_expectation(box.data + 0 * reg_max * plane + pos, reg_max, plane);
-                const float top = dfl_expectation(box.data + 1 * reg_max * plane + pos, reg_max, plane);
-                const float right = dfl_expectation(box.data + 2 * reg_max * plane + pos, reg_max, plane);
-                const float bottom = dfl_expectation(box.data + 3 * reg_max * plane + pos, reg_max, plane);
+                const float left = dfl_expectation(box_data + 0 * reg_max * plane + pos, reg_max, plane);
+                const float top = dfl_expectation(box_data + 1 * reg_max * plane + pos, reg_max, plane);
+                const float right = dfl_expectation(box_data + 2 * reg_max * plane + pos, reg_max, plane);
+                const float bottom = dfl_expectation(box_data + 3 * reg_max * plane + pos, reg_max, plane);
                 const float cx = (static_cast<float>(w) + 0.5f) * st_w;
                 const float cy = (static_cast<float>(h) + 0.5f) * st_h;
                 boxes.push_back({best, best_score, cx - left * st_w, cy - top * st_h,

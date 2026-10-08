@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 3.1–3.3**：卷积形状特化（1×1 直通，跳过 im2col）、收尾融合（Conv+SiLU 合成一个节点）与多线程（算子内数据并行，任意线程数输出与单线程逐位一致）。运行时子图从 152 节点减到 95 节点；AVX2 下 1×1 直通经同机交错对照约 1.50×，收尾融合在该机器上测不出差异（噪声范围内），多线程在本机 1→4 线程为 2.18×（avx2）/2.90×（sse）。第二次内存优化（Split 视图等）和检测后处理（DFL/NMS）尚未实现，仍不能输出检测框。
+**当前完成阶段 3.1–3.4**：卷积形状特化（1×1 直通）、收尾融合（Conv+SiLU 合成一个节点）、多线程（任意线程数输出与单线程逐位一致）与第二次内存优化（Split 零拷贝视图、图输入解钉、Add/SiLU 原地覆盖）。运行时子图 95 节点；激活 arena 从 18.75 降到 10.94 MiB，正好等于同时存活峰值下界。检测后处理（NMS/letterbox 反算）尚未实现，仍不能输出检测框。
 
 ## 进度
 
@@ -11,7 +11,7 @@
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
-| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 3.1–3.3 完成，其余待做 |
+| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 3.1–3.4 完成，3.5 待做 |
 | 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
 | 5 | 可选：INT8 卷积 / ARM NEON 移植 | 待实现 |
 
@@ -101,7 +101,7 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 | Split | axis、sizes | 连续行优先张量的切分 |
 | Add | 无 | 两个输入同形状，不支持广播 |
 
-前端负责确认 ONNX 属性属于上述支持范围，并将参数型常量输入降级成运行时属性。版本 2 增加了 Conv 的可选 `act` 属性；旧运行时读到版本 2 会明确拒绝（见 `runtime/model.cpp` 的版本检查），不会把 `act` 当未知属性忽略后静默算出没有激活的错误结果。当前不是通用 ONNX 解释器，也不宣称能够安全读取任意不可信模型文件。
+前端负责确认 ONNX 属性属于上述支持范围，并将参数型常量输入降级成运行时属性。版本 2 增加了 Conv 的可选 `act` 属性；旧运行时读到版本 2 会明确拒绝（见 `runtime/model.cpp` 的版本检查），不会把 `act` 当未知属性忽略后静默算出没有激活的错误结果。Split 视图与原地覆盖都是**运行时内存规划层面**的属性，不改模型文件格式：`model.txt` 里 Split 仍是普通节点，执行器在规划前决定它的输出是指进父张量的切片还是独立缓冲。当前不是通用 ONNX 解释器，也不宣称能够安全读取任意不可信模型文件。
 
 ## 逐层对拍
 
@@ -119,6 +119,51 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 未实现算子会标记 REF 并使用参考输出，**不能据此宣称整网通过**；误差传播也会被 REF 节点截断。
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
+
+### 阶段 3.4：Split 视图、输入解钉与原地覆盖
+
+三项都在内存侧，数值必须逐位不变：
+
+1. **Split 零拷贝视图**（`memory_plan.cpp: mark_split_views`）：batch=1 时 Split 的每个输出就是父张量的一段连续切片，把它标记成视图（`Tensor::view_of` / `view_offset`）——不占 arena、不拷贝，`data` 直接指进父张量的对应偏移，Split 内核退化成空操作。多 batch 时切片在内存里不连续，保持原来的拷贝路径。规划器把父张量的生命周期延到最晚的视图消费者，独立校验器检查视图落在父槽位内、父张量活得够久。8 个 Split 的 16 个输出全部命中。
+2. **图输入解钉**：输入的槽位在最后一次被读之后即可被后续激活复用（此前保留到执行结束，白占 4.9 MiB）。**契约变化**：每次 `run()` 之前必须重新 `set_input`；CLI、测试与基准工具都按此调用。
+3. **原地覆盖**（`plan_reuse` 的 `in_place_target`）：Add/SiLU 读写同一批元素，当某个输入在本节点死亡、不是常量/视图/图输出、没有被任何视图引用、且与输出同样大时，输出直接写进它的槽位。6 个 Add 全部命中。非逐元素算子（Conv/MaxPool/Concat/Split/UpsampleNearest）一律不做原地——池化的窗口读和写会互相踩。
+
+| 指标 | 阶段 3.3 | 阶段 3.4 |
+|---|---:|---:|
+| 激活 arena（reuse） | 18.75 MiB | **10.94 MiB** |
+| 同时存活峰值（独立统计的下界） | 10.94 MiB | 10.94 MiB |
+| 激活 arena（naive 对照） | 105.83 MiB | 96.46 MiB |
+| 视图张量 / 原地输出 | 0 / 0 | 16 / 6 |
+
+- arena 降低 42%，并且**正好等于按生命周期独立算出的同时存活峰值**：贪心规划已经没有碎片损失。
+- 这三个数字不是同一个量：arena 是激活缓冲，权重 12.02 MiB 和卷积工作区 18.5 MiB 在进程里另外占着，别把它们相加后当成 RSS。
+
+验证：
+
+- 12 组对拍（scalar/sse/avx2 × bus/zidane × isolated/chained，threads=4）全部 `FAIL=0、REF=0`，EXACT/OK 分布与阶段 3.3 完全一致。
+- **新旧二进制逐位对照**：阶段 3.3 与 3.4 的可执行文件、同一模型、同一输入，六路输出 12/12 文件 `cmp` 逐位相同（sse/avx2 × threads=4）。内存布局变化没有改变任何一个数值。
+- 新增 11 组 C++ 内存契约测试：原地链塌缩成单个槽位、非逐元素不原地、输入仍被后续节点读取时禁止覆盖、视图标记与越界拒绝、多 batch 不做视图、视图执行原样复现输入、原地与 naive 逐位一致。54 个 Python 测试、2 个 CTest 目标在 Release 与 ASan/UBSan 下通过；TSan 下 `test_memory_plan`、`test_simd_runtime` 与真实模型 verify/run 无竞争报告。
+- 真实模型 `./build/test_memory_plan artifacts/model artifacts/ref/input.bin`：naive 与 reuse 六路输出逐位相同（`REAL_MODEL_EXACT outputs=6 naive_bytes=101145600 reuse_bytes=11468800 views=16 in_place=6`）。
+
+计时（同机交错 ABBA/BAAB，fresh process，avx2）：
+
+| 配置 | 阶段 3.3 中位数 | 阶段 3.4 中位数 | 之比 |
+|---|---:|---:|---:|
+| threads=1（8 采样/变体） | 124.59 ms | 121.66 ms | 0.98（范围完全重叠，视为噪声） |
+| threads=4（8 采样/变体） | 48.05 ms | 44.64 ms | 0.93 |
+| threads=4（16 采样/变体） | 47.48 ms | 44.28 ms | 0.93 |
+
+- 单线程测不出差异。4 线程下两次独立交错都落在 0.93，但样本范围仍有重叠，只能作为方向性观察（Split 不再拷贝；原地覆盖让写回落在刚读过的缓存行上）。**这一阶段的主要收益是内存，不是速度。**
+- 报告：`artifacts/stage34-memory-avx2-t1.json`（SHA256 `e420bc5287d5c69d1faf05beff784cd921be91898bcefac11ff8bd5109ddeada`）、`artifacts/stage34-memory-avx2-t4.json`（`1324360492e238a232dcee3a474789089b860c4840462424ad4028ea631ef89d`）、`artifacts/stage34-memory-avx2-t4-blocks8.json`（`93b211941bf02392091cc5dae160e8cb399af21fde51b4ca11a3ab67e2ff5e92`）。
+
+```bash
+./build/yinfer info artifacts/model --backend avx2        # views=16 in_place=6，arena 与峰值下界
+./build/test_memory_plan artifacts/model artifacts/ref/input.bin
+./build/yinfer verify artifacts/model artifacts/ref --backend avx2 --mode chained --threads 4 --brief
+# 内存消融：基线 = 阶段 3.4，候选 = 阶段 3.3 的二进制
+python3 scripts/benchmark_backends.py --backend avx2 --threads 4 \
+    --alt-binary artifacts/yinfer-stage33 --alt-label stage33 --blocks 8 --out artifacts/stage34-memory-avx2-t4-blocks8.json
+```
 
 ### 阶段 3.3：多线程
 
@@ -339,8 +384,8 @@ python3 frontend/make_reference.py --image "$IMAGE" --out artifacts/stage1-zidan
 策略与边界：
 
 - 按节点顺序计算每个激活的闭区间生命周期；只有 `旧张量最后使用节点 < 新张量生产节点` 才能复用。
-- 同一节点的输入、输出以及多个输出互不覆盖；不做原地算子或 Split 视图别名。
-- 图输入和图输出保留到执行结束：支持只 `set_input` 一次后连续 `run`，早期图输出不会被后续节点覆盖。
+- 同一节点的输入、输出以及多个输出互不覆盖；不做原地算子或 Split 视图别名。**（阶段 3.4 已放宽：Add/SiLU 允许原地覆盖已死亡的输入，batch=1 的 Split 输出改成零拷贝视图；同一节点内部的覆盖规则仍然禁止，见阶段 3.4 一节。）**
+- 图输入和图输出保留到执行结束：支持只 `set_input` 一次后连续 `run`，早期图输出不会被后续节点覆盖。**（阶段 3.4 起图输入改为按最后消费者释放：每次 `run` 之前必须重新 `set_input`；图输出仍然保留到结束。）**
 - 选择最小的足够大空闲块，拆分剩余空间，并合并相邻空闲块；所有偏移保持 64 字节对齐。这是启发式方案，不保证全局最优。
 - 独立检查范围、对齐和活跃区间重叠；ASan 不一定能发现同一 arena 内部的数据覆盖。
 - 只适用于顺序执行、连续张量和无视图别名的当前模型契约。中间张量过了生命周期后不再保证保留，逐层对拍必须在执行当前节点后立即进行。

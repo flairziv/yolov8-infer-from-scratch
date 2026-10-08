@@ -4,7 +4,7 @@
 
 namespace yi {
 
-enum class Backend { Scalar, SSE, AVX2 };
+enum class Backend { Scalar, SSE, AVX2, CUDA };
 
 Backend parse_backend(const std::string& name);
 const char* backend_name(Backend backend);

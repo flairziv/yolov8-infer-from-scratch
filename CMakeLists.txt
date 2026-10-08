@@ -15,6 +15,7 @@ endif()
 option(YI_SANITIZE "AddressSanitizer + UBSan" OFF)
 option(YI_TSAN "ThreadSanitizer（并发正确性检查；与 YI_SANITIZE 互斥）" OFF)
 option(YI_ENABLE_X86_SIMD "在 x86-64 GCC/Clang 上构建 SSE2 与 AVX2/FMA 后端" ON)
+option(YI_ENABLE_CUDA "构建 CUDA 后端（需要 CUDA 工具链与 NVIDIA 设备；未启用时后端明确报不可用）" OFF)
 
 add_compile_options(-Wall -Wextra)
 if(YI_SANITIZE AND YI_TSAN)
@@ -43,6 +44,23 @@ add_library(yinfer_core STATIC
 target_include_directories(yinfer_core PUBLIC runtime)
 target_link_libraries(yinfer_core PUBLIC Threads::Threads)
 
+if(YI_ENABLE_CUDA)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  # 目标架构：Ada（RTX 40 系，sm_89）。换设备时改这里，或用 -DCMAKE_CUDA_ARCHITECTURES=native。
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89)
+  endif()
+  target_sources(yinfer_core PRIVATE runtime/cuda/cuda_api.cu runtime/cuda/cuda_ops.cu)
+  target_compile_definitions(yinfer_core PRIVATE YI_ENABLE_CUDA=1)
+  # 设备代码不参与主机侧 sanitizer；CUDA 源只编译一次，走 nvcc 的默认优化。
+  set_source_files_properties(runtime/cuda/cuda_api.cu runtime/cuda/cuda_ops.cu PROPERTIES
+                              COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info>")
+else()
+  target_sources(yinfer_core PRIVATE runtime/cuda/cuda_api_stub.cpp runtime/cuda/cuda_ops_stub.cpp)
+endif()
+
 if(YI_ENABLE_X86_SIMD AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"
    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_definitions(yinfer_core PRIVATE YI_X86_SIMD=1)
@@ -68,4 +86,8 @@ if(BUILD_TESTING)
   target_include_directories(test_postprocess PRIVATE tools)
   target_link_libraries(test_postprocess PRIVATE yinfer_core)
   add_test(NAME postprocess COMMAND test_postprocess)
+  # 没有 CUDA 的构建里这个测试打印 SKIP 并返回 0，不冒充通过。
+  add_executable(test_cuda_runtime tests/test_cuda_runtime.cpp)
+  target_link_libraries(test_cuda_runtime PRIVATE yinfer_core)
+  add_test(NAME cuda_runtime COMMAND test_cuda_runtime)
 endif()

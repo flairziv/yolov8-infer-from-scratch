@@ -63,8 +63,9 @@ void print_missing(const Executor& ex) {
 }
 
 void print_backend(const Executor& ex) {
-    std::printf("backend=%s threads=%d workspace_bytes=%zu simd_nodes=%zu fallback_nodes=%zu\n",
-                backend_name(ex.backend()), ex.threads(), ex.workspace_bytes(), ex.simd_nodes(), ex.fallback_nodes());
+    std::printf("backend=%s threads=%d workspace_bytes=%zu simd_nodes=%zu fallback_nodes=%zu views=%zu in_place=%zu\n",
+                backend_name(ex.backend()), ex.threads(), ex.workspace_bytes(), ex.simd_nodes(), ex.fallback_nodes(),
+                ex.view_tensors(), ex.in_place_tensors());
 }
 
 int cmd_info(const std::string& model_dir, Backend backend, int threads) {
@@ -88,8 +89,8 @@ int cmd_info(const std::string& model_dir, Backend backend, int threads) {
                 m.tensors.size(), n_const, mib(m.weights.bytes()), n_act, mib(ex.arena_bytes()));
     for (int i : m.inputs) std::printf("  输入 %-16s %s\n", m.tensors[i].shape_str().c_str(), m.tensors[i].name.c_str());
     for (int i : m.outputs) std::printf("  输出 %-16s %s\n", m.tensors[i].shape_str().c_str(), m.tensors[i].name.c_str());
-    std::printf("  激活规划：reuse %.2f MiB；naive 对照 %.2f MiB（不含权重、参考数据与进程其他内存）\n",
-                mib(ex.arena_bytes()), mib(plan_naive(m).total));
+    std::printf("  激活规划：reuse %.2f MiB（同时存活峰值下界 %.2f MiB）；naive 对照 %.2f MiB（不含权重、参考数据与进程其他内存）\n",
+                mib(ex.arena_bytes()), mib(peak_live_bytes(m)), mib(plan_naive(m).total));
     std::printf("  卷积计算量 %.2f GFLOP\n", flops / 1e9);
     print_missing(ex);
     return 0;

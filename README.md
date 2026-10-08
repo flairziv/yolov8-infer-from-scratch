@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 3.1–3.2**：卷积形状特化（1×1 直通，跳过 im2col）与收尾融合（Conv+SiLU 合成一个节点，激活在寄存器里直接算）。运行时子图从 152 节点减到 95 节点；AVX2 下 1×1 直通经同机交错对照约 1.50×，收尾融合在该机器上测不出差异（噪声范围内）。多线程、第二次内存优化（Split 视图等）和检测后处理（DFL/NMS）尚未实现，仍不能输出检测框。
+**当前完成阶段 3.1–3.3**：卷积形状特化（1×1 直通，跳过 im2col）、收尾融合（Conv+SiLU 合成一个节点）与多线程（算子内数据并行，任意线程数输出与单线程逐位一致）。运行时子图从 152 节点减到 95 节点；AVX2 下 1×1 直通经同机交错对照约 1.50×，收尾融合在该机器上测不出差异（噪声范围内），多线程在本机 1→4 线程为 2.18×（avx2）/2.90×（sse）。第二次内存优化（Split 视图等）和检测后处理（DFL/NMS）尚未实现，仍不能输出检测框。
 
 ## 进度
 
@@ -11,7 +11,7 @@
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
-| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 3.1–3.2 完成，其余待做 |
+| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 3.1–3.3 完成，其余待做 |
 | 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
 | 5 | 可选：INT8 卷积 / ARM NEON 移植 | 待实现 |
 
@@ -119,6 +119,50 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 未实现算子会标记 REF 并使用参考输出，**不能据此宣称整网通过**；误差传播也会被 REF 节点截断。
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
+
+### 阶段 3.3：多线程
+
+- **线程池**（`runtime/thread_pool.{h,cpp}`）：固定线程数，`parallel_for` 用原子计数器动态领取工作单元（先做完的线程接着领下一块）；工作单元抛异常时其余单元尽快停下，异常在调用线程重抛；`worker_slot()` 给每个线程一个私有槽位。线程池随 `Executor` 创建一次，节点之间复用，不在每个节点上反复建线程。
+- **并行分解**（只在 SIMD 后端；标量后端保持单线程，继续充当逐位参考）：
+  - Conv 按输出列块（j 方向）切分；每个工作单元把 K×NR 面板打包进**自己线程的槽位**，写出的输出列互不重叠。
+  - im2col 按展开矩阵的行（ci,kh,kw）并行，K*N ≥ 65536 才并行（小层不值得付唤醒开销）。
+  - Add/SiLU 按 32K 元素分块；MaxPool 按 (n,c) 平面。Concat/Split/UpsampleNearest 仍是共享标量实现，不参与并行。
+- **工作区**：打包面板按线程数复制，`workspace_bytes` 从 18478080（1 线程）增到 18616320（4 线程），+138240 字节 = 每线程 45 KiB（来自 Cin=80 的 3×3 层）；激活 arena 不变（18.75 MiB）——线程数只影响临时空间，不影响内存规划。
+- **默认线程数 1**，`--threads N` 显式开启（`info/run/verify` 都支持）。工作单元彼此独立 ⇒ **任意线程数的输出与单线程逐位一致**，这不是容差内的近似。
+
+验证（全部 `FAIL=0、REF=0`，阈值 `rel<=1e-4` 未放宽）：
+
+| 门禁 | 结果 |
+|---|---|
+| 12 组真实模型（scalar/sse/avx2 × bus/zidane × isolated/chained，threads=4） | 全部通过，EXACT/OK 分布与单线程完全一致（如 avx2 isolated 46/57） |
+| 六路输出 threads=1 vs 4（sse/avx2 各 6 个 dump，`cmp`） | 12/12 逐位相同 |
+| 54 个 Python 测试 + 2 个 CTest 目标（Release 与 ASan/UBSan） | 通过；新增 `tests/test_threads.py`（1/4/16 线程 dump 逐位、工作区随线程数增长、非法线程数拒绝）与 C++ `check_threads`（含线程数多于列块数的"空工作单元"路径） |
+
+TSan：本机内核 `mmap_rnd_bits` 偏高，TSan 启动时约一半概率报 `unexpected memory mapping`；**没有修改系统 ASLR 设置**（`setarch -R` 与 `-no-pie` 两个方案都未采用），改为重试到 TSan 正常启动——成功启动的运行（单元测试 + 真实模型 run + verify，`halt_on_error=1`）没有竞争报告。
+
+同机交错计时（ABBA/BAAB × 4 块，每变体 8 个采样，fresh process，C++ run 内部计时，WSL 4 vCPU）：
+
+| 后端 | 1 线程中位数 | 4 线程中位数 | 中位数之比 |
+|---|---:|---:|---:|
+| avx2 | 116.72 ms | 53.24 ms | **2.18×** |
+| sse | 267.69 ms | 92.44 ms | **2.90×** |
+
+- 这是**本机 1→4 线程**的对照：不是"4 核理想 4×"，也不能外推到其它核数或设备。VM 只有 4 个 vCPU（宿主 24 线程），更多线程数未测。
+- SSE 的扩展性优于 AVX2，与 AVX2 更受内存带宽限制一致；剩余串行部分包括阈值以下的 im2col、Concat/Split/Upsample 的标量拷贝，以及每层两次并行区之间的同步开销。
+- 报告：`artifacts/stage3-threads-avx2.json`（SHA256 `865ca2fe1f9aaf0154f16064de4a298a07b0c35896b23591a9982b348196364f`）、`artifacts/stage3-threads-sse.json`（`a9441a10fd3ede203d56ea9132a26554645aa5bc6bd6b13a245ffefd58027152`）。
+
+```bash
+bash scripts/build.sh
+./build/yinfer info artifacts/model --backend avx2 --threads 4
+./build/yinfer verify artifacts/model artifacts/ref --backend avx2 --mode chained --threads 4 --brief
+./build/yinfer run artifacts/model artifacts/ref/input.bin --backend avx2 --threads 4 --dump-dir artifacts/t4
+# 线程数消融（基线 1 线程，候选 4 线程）
+python3 scripts/benchmark_backends.py --backend avx2 --threads 1 --alt-threads 4 \
+    --blocks 4 --out artifacts/stage3-threads-avx2.json
+# 并发检查：TSan 需要能正常启动（本机内核需重试）；ASan/UBSan 回归
+BUILD_DIR=build-tsan bash scripts/build.sh -DYI_TSAN=ON
+BUILD_DIR=build-asan bash scripts/build.sh -DYI_SANITIZE=ON
+```
 
 ### 阶段 3.1–3.2：1×1 直通与收尾融合
 

@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 3.1–3.4**：卷积形状特化（1×1 直通）、收尾融合（Conv+SiLU 合成一个节点）、多线程（任意线程数输出与单线程逐位一致）与第二次内存优化（Split 零拷贝视图、图输入解钉、Add/SiLU 原地覆盖）。运行时子图 95 节点；激活 arena 从 18.75 降到 10.94 MiB，正好等于同时存活峰值下界。检测后处理（NMS/letterbox 反算）尚未实现，仍不能输出检测框。
+**当前完成阶段 3.1–3.5**：卷积形状特化、Conv+SiLU 收尾融合、多线程（任意线程数输出与单线程逐位一致）、第二次内存优化（Split 视图、输入解钉、原地覆盖）与检测后处理（DFL 解码 + 类内 NMS + letterbox 反算，能画框）。激活 arena 从 18.75 降到 10.94 MiB；bus.jpg 与 zidane.jpg 的检测框与 Ultralytics 在**同一 letterbox 几何**下逐框 IoU ≥ 0.9998。
 
 ## 进度
 
@@ -11,7 +11,7 @@
 | 0 | 前端导出与模型格式、C++ 加载与执行骨架、逐层对拍工具 | 完成 |
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
-| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 3.1–3.4 完成，3.5 待做 |
+| 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | **完成** |
 | 4 | CUDA 后端：隐式 GEMM、共享内存与寄存器分块 | 待实现 |
 | 5 | 可选：INT8 卷积 / ARM NEON 移植 | 待实现 |
 
@@ -30,7 +30,7 @@ C++ 运行时 runtime/（不依赖推理库）
   tools/yinfer：info（模型概况）/ run（子图独立执行）/ verify（逐层对拍）
 ```
 
-前端导出的目标子图位于检测头 DFL 解码之前：95 个节点、7 种算子，输出 3 个尺度各一个框分支（64 通道）和类别分支（80 通道）。57 个卷积带 `act=1`，SiLU 收尾已融进卷积。DFL 解码、坐标变换和 NMS 计划放在 C++ 后处理里；这种拆分思路也常用于 NPU 部署，但具体支持范围取决于工具链和版本。
+前端导出的目标子图位于检测头 DFL 解码之前：95 个节点、7 种算子，输出 3 个尺度各一个框分支（64 通道）和类别分支（80 通道）。57 个卷积带 `act=1`，SiLU 收尾已融进卷积。DFL 解码、sigmoid、坐标变换和 NMS 在 C++ 后处理里实现（`tools/postprocess.cpp` + `yinfer detect`，见阶段 3.5）；这种拆分思路也常用于 NPU 部署，但具体支持范围取决于工具链和版本。
 
 | 项目 | 值 |
 |---|---|
@@ -119,6 +119,33 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 未实现算子会标记 REF 并使用参考输出，**不能据此宣称整网通过**；误差传播也会被 REF 节点截断。
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
+
+### 阶段 3.5：检测后处理（能画框）
+
+子图停在检测头卷积之后，所以框分支还没做 DFL softmax、类别分支还没做 sigmoid，这些都在后处理里补：
+
+- `tools/postprocess.cpp`：**DFL 期望**（对 16 个 bin 做 softmax 再取加权期望）、**sigmoid**、置信度过滤、**类内贪心 NMS**、letterbox 反算。尺度配对不写死顺序——按 (H,W) 把图输出两两配成框/类别分支，步长由输入边长推出；通道数不匹配、配不成对会明确报错。
+- `yinfer detect <模型目录> <input.bin> [--conf 0.25] [--iou 0.7] [--backend] [--threads] [--letterbox 缩放,左右填充,上下填充] [--out 文件]`：不给 `--letterbox` 时框坐标在 letterbox 后的输入图里，给了就反算回原图坐标。
+- `scripts/detect.py`：从参考目录的 `meta.txt` 读 letterbox 参数，跑二进制、画框、并与官方实现逐框对照。
+
+对照口径（这一条很关键）：Ultralytics 的 `predict` 对 `.pt` 模型默认用 **auto letterbox**（只把边长补齐到 stride 的整数倍，不填满方形），与本项目的固定方形 letterbox 不是同一种几何——直接比会差几个像素。所以脚本把**同一张 letterbox 后的 640×640 图**喂给两边，框都在同一坐标系里比较；参考权重用 `artifacts/yolov8n.pt`（与导出 ONNX 的同一份）。
+
+| 图片 | 框数（本引擎 / 参考） | 最小配对 IoU | 坐标最大偏差 | 分数最大偏差 |
+|---|---|---:|---:|---:|
+| bus.jpg（810×1080） | 5 / 5 | 0.9998 | 0.04 px | 5e-4 |
+| zidane.jpg（1280×720） | 3 / 3 | 0.9999 | 0.02 px | 7e-4 |
+
+- bus.jpg 检到 4 个人 + 1 辆巴士，zidane.jpg 检到 2 个人 + 1 条领带（cls 27），与参考一致。
+- 画框图 `artifacts/detect-bus.jpg`、`artifacts/detect-zidane.jpg`（绿=本引擎，红=参考，不提交）；对照报告 `artifacts/detect-bus.json`、`artifacts/detect-zidane.json`。
+- 验证：C++ `test_postprocess`（DFL 均匀分布的手算期望、尖峰分布趋近对应 bin、sigmoid 分数、阈值过滤、NMS 的同类抑制/跨类保留/IoU 等于阈值的边界/零面积框/重叠链、letterbox 反算、非法输入拒绝）；Python `tests/test_postprocess.py`（合成检测头模型 + 独立 numpy 参考实现，三组 conf/iou 下逐框 IoU>0.999 且分数一致到 2e-4）。58 个 Python 测试、3 个 CTest 目标在 Release 与 ASan/UBSan 下通过。
+- 边界：只支持这个子图的输出布局（3 尺度、DFL reg_max=16、无 objectness、类内 NMS）；不支持 agnostic NMS、多标签、旋转框、分割/姿态头。对照只说明这两张图的框与官方实现一致，不是 mAP 评测。
+
+```bash
+./build/yinfer detect artifacts/model artifacts/ref/input.bin --backend avx2 --threads 4 --conf 0.25 --iou 0.7
+python3 scripts/detect.py --ref artifacts/ref --out artifacts/detect-bus.jpg --report artifacts/detect-bus.json
+python3 scripts/detect.py --ref artifacts/stage1-zidane --out artifacts/detect-zidane.jpg
+python3 tests/test_postprocess.py
+```
 
 ### 阶段 3.4：Split 视图、输入解钉与原地覆盖
 

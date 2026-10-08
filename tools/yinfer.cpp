@@ -2,6 +2,7 @@
 //   yinfer info   <模型目录>                          模型概况：算子统计、权重和激活内存、卷积计算量
 //   yinfer run    <模型目录> <input.bin>              整图执行一遍；有算子没实现会列出来
 //   yinfer verify <模型目录> <参考数据目录> [选项]      逐层和 ORT 对拍
+//   yinfer detect <模型目录> <input.bin> [选项]        DFL 解码 + 类内 NMS，输出检测框
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "executor.h"
+#include "postprocess.h"
 #include "reference.h"
 
 using namespace yi;
@@ -26,6 +28,7 @@ void usage() {
         "  yinfer info   <模型目录> [--backend scalar|sse|avx2] [--threads N]\n"
         "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2] [--memory naive|reuse] [--threads N] [--dump-dir 目录]\n"
         "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2] [--mode isolated|chained] [--tol 1e-4] [--threads N] [--perturb 节点号] [--brief]\n"
+        "  yinfer detect <模型目录> <input.bin> [--conf 0.25] [--iou 0.7] [--backend scalar|sse|avx2] [--threads N] [--letterbox 缩放,左右填充,上下填充] [--out 文件]\n"
         "\n"
         "verify 的两种模式:\n"
         "  isolated  每个节点都从参考数据取输入，只量这一层自己引入的误差（默认）\n"
@@ -34,7 +37,9 @@ void usage() {
         "--threads N  算子内部数据并行（默认 1）。工作单元彼此独立，任意线程数的输出与单线程逐位一致\n"
         "--perturb N  执行完第 N 个节点后故意改坏它的输出，用来确认对拍工具真能抓到错\n"
         "--brief      不打印 REF 行\n"
-        "--memory naive|reuse  验证时选择内存规划，默认 reuse（不是原地算子）\n");
+        "--memory naive|reuse  验证时选择内存规划，默认 reuse（不是原地算子）\n"
+        "\n"
+        "detect 输出的是框坐标；给了 --letterbox 就换算回原图坐标，否则是 letterbox 后的输入图坐标\n");
 }
 
 double mib(size_t bytes) { return bytes / 1024.0 / 1024.0; }
@@ -49,6 +54,29 @@ int parse_threads(const std::string& v) {
     }
     YI_CHECK(pos == v.size() && threads >= 1 && threads <= 1024, "--threads 需要是 1..1024 的整数，收到 " << v);
     return threads;
+}
+
+float parse_float(const std::string& v, const char* what) {
+    size_t pos = 0;
+    float f = 0;
+    try {
+        f = std::stof(v, &pos);
+    } catch (const std::exception&) {
+        YI_CHECK(false, what << " 不是数: " << v);
+    }
+    YI_CHECK(pos == v.size() && std::isfinite(f), what << " 不是合法的数: " << v);
+    return f;
+}
+
+std::vector<std::string> split_commas(const std::string& s) {
+    std::vector<std::string> out;
+    size_t begin = 0;
+    while (true) {
+        const size_t comma = s.find(',', begin);
+        out.push_back(s.substr(begin, comma == std::string::npos ? comma : comma - begin));
+        if (comma == std::string::npos) return out;
+        begin = comma + 1;
+    }
 }
 
 void print_missing(const Executor& ex) {
@@ -240,10 +268,58 @@ int cmd_verify(const std::string& model_dir, const std::string& ref_dir, const V
     return count["FAIL"] > 0 ? 1 : 0;
 }
 
+struct DetectOptions {
+    float conf = 0.25f;
+    float iou = 0.7f;
+    Backend backend = Backend::Scalar;
+    int threads = 1;
+    bool letterbox = false;
+    float scale = 1.0f, pad_x = 0.0f, pad_y = 0.0f;
+    std::string out;
+};
+
+int cmd_detect(const std::string& model_dir, const std::string& input_path, const DetectOptions& opt) {
+    Model m = Model::load(model_dir);
+    Executor ex(m, true, opt.backend, opt.threads);
+    print_backend(ex);
+    if (!ex.missing_kernels().empty()) {
+        std::printf("整图还跑不了（可以先用 yinfer verify 对拍已经实现的部分）\n");
+        print_missing(ex);
+        return 2;
+    }
+    YI_CHECK(m.inputs.size() == 1, "detect 命令当前只接受一个图输入");
+    const Tensor& in = m.tensors[m.inputs[0]];
+    const AlignedBuffer x = read_file(input_path, static_cast<int64_t>(in.bytes()));
+    ex.set_input(0, x.as<float>());
+    const auto t0 = std::chrono::steady_clock::now();
+    ex.run();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    const auto decoded = dfl_decode(m, opt.conf);
+    const size_t decoded_count = decoded.size();
+    auto boxes = nms(decoded, opt.iou);
+    if (opt.letterbox) unletterbox(boxes, opt.scale, opt.pad_x, opt.pad_y);
+    std::printf("检测到 %zu 个框（conf>=%.2f 留下 %zu 个，类内 iou>%.2f 抑制 %zu 个；坐标：%s）\n",
+                boxes.size(), opt.conf, decoded_count, opt.iou, decoded_count - boxes.size(),
+                opt.letterbox ? "原图" : "letterbox 后的输入图");
+    std::printf("  %-5s %8s %9s %9s %9s %9s\n", "class", "score", "x1", "y1", "x2", "y2");
+    for (const Detection& d : boxes)
+        std::printf("  %-5d %8.4f %9.2f %9.2f %9.2f %9.2f\n", d.cls, d.score, d.x1, d.y1, d.x2, d.y2);
+    if (!opt.out.empty()) {
+        std::ofstream f(opt.out);
+        YI_CHECK(f, "无法写入 " << opt.out);
+        for (const Detection& d : boxes)
+            f << d.cls << " " << d.score << " " << d.x1 << " " << d.y1 << " " << d.x2 << " " << d.y2 << "\n";
+        YI_CHECK(f, "写 " << opt.out << " 失败");
+        std::printf("框已写入 %s\n", opt.out.c_str());
+    }
+    std::printf("整图一次 %.6f ms（单次，含冷启动）\n", ms);
+    return 0;
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
-    try {
+int main(int argc, char** argv) {    try {
         if (argc == 2 && std::string(argv[1]) == "backends") {
             for (Backend b : {Backend::Scalar, Backend::SSE, Backend::AVX2})
                 std::printf("%s %s\n", backend_name(b), backend_available(b) ? "available" : "unavailable");
@@ -318,6 +394,38 @@ int main(int argc, char** argv) {
                 }
             }
             return cmd_verify(argv[2], argv[3], opt);
+        }
+        if (cmd == "detect" && argc >= 4) {
+            DetectOptions opt;
+            for (int i = 4; i < argc; ++i) {
+                const std::string a = argv[i];
+                auto value = [&]() -> std::string {
+                    YI_CHECK(i + 1 < argc, a << " 后面缺参数");
+                    return argv[++i];
+                };
+                if (a == "--conf") {
+                    opt.conf = parse_float(value(), "--conf");
+                } else if (a == "--iou") {
+                    opt.iou = parse_float(value(), "--iou");
+                } else if (a == "--backend") {
+                    opt.backend = parse_backend(value());
+                } else if (a == "--threads") {
+                    opt.threads = parse_threads(value());
+                } else if (a == "--out") {
+                    opt.out = value();
+                } else if (a == "--letterbox") {
+                    const auto parts = split_commas(value());
+                    YI_CHECK(parts.size() == 3, "--letterbox 需要 缩放,左右填充,上下填充");
+                    opt.scale = parse_float(parts[0], "--letterbox 缩放");
+                    opt.pad_x = parse_float(parts[1], "--letterbox 左右填充");
+                    opt.pad_y = parse_float(parts[2], "--letterbox 上下填充");
+                    opt.letterbox = true;
+                } else {
+                    usage();
+                    return 1;
+                }
+            }
+            return cmd_detect(argv[2], argv[3], opt);
         }
         usage();
         return 1;

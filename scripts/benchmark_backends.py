@@ -9,6 +9,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -25,18 +26,21 @@ def sha(path):
     return digest.hexdigest()
 
 
-def command(argv):
-    result = subprocess.run(list(map(str, argv)), capture_output=True, encoding="utf-8", timeout=300)
+def command(argv, env=None):
+    merged = dict(os.environ)
+    merged.update(env or {})
+    result = subprocess.run(list(map(str, argv)), capture_output=True, encoding="utf-8", timeout=300, env=merged)
     if result.returncode:
         raise RuntimeError(f"exit={result.returncode}: {' '.join(map(str, argv))}\n{result.stdout}\n{result.stderr}")
     return result.stdout
 
 
-def variant(label, binary, model, ref, backend, threads):
+def variant(label, binary, model, ref, backend, threads, env=None):
     binary, model, ref = Path(binary).resolve(), Path(model).resolve(), Path(ref).resolve()
     weights = next(line.split()[1] for line in (model / "model.txt").read_text(encoding="utf-8").splitlines()
                    if line.startswith("weights "))
     return {"label": label, "binary": binary, "model": model, "ref": ref, "backend": backend, "threads": threads,
+            "env": dict(env or {}),
             "sha256": {"binary": sha(binary), "model.txt": sha(model / "model.txt"), "weights": sha(model / weights),
                        "ref.txt": sha(ref / "ref.txt"), "ref.bin": sha(ref / "ref.bin")}}
 
@@ -48,26 +52,40 @@ def main():
     ap.add_argument("--model", default="artifacts/model")
     ap.add_argument("--input", default="artifacts/ref/input.bin")
     ap.add_argument("--ref", default="artifacts/ref")
-    ap.add_argument("--candidates", nargs="+", choices=["sse", "avx2"], default=["sse", "avx2"])
+    ap.add_argument("--candidates", nargs="+", choices=["sse", "avx2", "cuda"], default=["sse", "avx2"])
+    ap.add_argument("--baseline-backend", choices=["scalar", "sse", "avx2", "cuda"], default="scalar",
+                    help="后端对照模式下的基线后端；默认 scalar")
     ap.add_argument("--alt-model", default=None, help="消融模式：对照模型目录；与 --alt-ref 一起给出")
     ap.add_argument("--alt-ref", default=None)
     ap.add_argument("--alt-label", default=None, help="消融候选的标签；缺省按消融类型生成")
-    ap.add_argument("--backend", choices=["scalar", "sse", "avx2"], default="avx2",
+    ap.add_argument("--backend", choices=["scalar", "sse", "avx2", "cuda"], default="avx2",
                     help="消融模式下两个变体共用的后端")
     ap.add_argument("--threads", type=int, default=1, help="基线线程数（两种模式都生效）")
     ap.add_argument("--alt-threads", type=int, default=None, help="消融模式：对照线程数")
+    ap.add_argument("--alt-env", action="append", default=[],
+                    help="消融模式：只给候选变体设置的环境变量 KEY=VALUE，可重复（例如 YI_CUDA_CONV=naive）")
     ap.add_argument("--blocks", type=int, default=2)
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="每个进程内重复执行次数；>1 时取热身后各次的中位数计时，第一次单独记为 cold_ms")
     ap.add_argument("--out", default="artifacts/stage2-benchmark.json")
     args = ap.parse_args()
     if args.blocks < 2 or args.blocks % 2:
         ap.error("--blocks 必须是至少2的偶数，交替使用ABBA/BAAB")
+    if args.repeat < 1 or args.repeat > 10000:
+        ap.error("--repeat 需要在 1..10000 内")
     if bool(args.alt_model) != bool(args.alt_ref):
         ap.error("--alt-model 与 --alt-ref 必须同时给出")
     for name in ("threads", "alt_threads"):
         value = getattr(args, name)
         if value is not None and not 1 <= value <= 1024:
             ap.error(f"--{name.replace('_', '-')} 需要在 1..1024 内")
-    ablation = bool(args.alt_model or args.alt_threads or args.alt_binary)
+    alt_env = {}
+    for item in args.alt_env:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            ap.error(f"--alt-env 需要 KEY=VALUE，收到 {item!r}")
+        alt_env[key] = value
+    ablation = bool(args.alt_model or args.alt_threads or args.alt_binary or alt_env)
     out = Path(args.out)
     if out.exists():
         ap.error("报告已存在，请用 --out 指定新文件，避免覆盖旧证据")
@@ -76,33 +94,41 @@ def main():
 
     if ablation:
         # 线程数是唯一消融轴时用 threadsN 标签；其余情况用 baseline/候选标签。
-        threads_only = bool(args.alt_threads) and not args.alt_model and not args.alt_binary
+        threads_only = bool(args.alt_threads) and not args.alt_model and not args.alt_binary and not alt_env
         baseline = variant(f"threads{args.threads}" if threads_only else "baseline",
                            args.binary, args.model, args.ref, args.backend, args.threads)
         candidate = variant(args.alt_label or (f"threads{args.alt_threads}" if threads_only else "alt"),
                             alt_binary, args.alt_model or args.model, args.alt_ref or args.ref, args.backend,
-                            args.alt_threads or args.threads)
+                            args.alt_threads or args.threads, alt_env)
         axes = [name for name, value in (("binary", args.alt_binary), ("model", args.alt_model),
-                                         ("threads", args.alt_threads)) if value]
+                                         ("threads", args.alt_threads), ("env", alt_env)) if value]
         scope = (f"single-machine {'+'.join(axes)} ablation at backend={args.backend}, "
                  f"baseline threads={baseline['threads']} candidate threads={candidate['threads']}, "
                  "same input image; not a claim about detector accuracy")
     else:
-        baseline = variant("scalar", args.binary, args.model, args.ref, "scalar", args.threads)
-        scope = "single-machine CPU backend comparison, not pure SIMD width or detector accuracy"
+        baseline = variant(args.baseline_backend, args.binary, args.model, args.ref, args.baseline_backend,
+                           args.threads)
+        scope = ("single-machine CPU/GPU backend comparison, not pure SIMD width or detector accuracy"
+                 if "cuda" in args.candidates else
+                 "single-machine CPU backend comparison, not pure SIMD width or detector accuracy")
     variants = [baseline] if not ablation else [baseline, candidate]
     if not ablation:
         variants += [variant(name, args.binary, args.model, args.ref, name, args.threads) for name in args.candidates]
 
     report = {"schema_version": 3, "created_at": datetime.now(timezone.utc).isoformat(),
-              "passed": False, "platform": platform.platform(), "timing": "C++ run internal elapsed milliseconds",
+              "passed": False, "platform": platform.platform(),
+              "timing": ("C++ run internal elapsed milliseconds: median of warm runs inside each fresh process "
+                         f"(repeat={args.repeat}); the first run is recorded separately as cold_ms"
+                         if args.repeat > 1 else
+                         "C++ run internal elapsed milliseconds (first and only run inside each fresh process)"),
+              "repeat": args.repeat,
               "scope": scope,
               "ordering": "alternating ABBA/BAAB blocks, fresh process per sample, one warm-up per pair/variant",
               "limitations": ["host scheduling and frequency are not controlled", "first run inside each fresh process",
                               "load averages are observations, not a resource-isolation gate"],
               "verification": {}, "variants": {v["label"]: {"binary": str(v["binary"]), "model": str(v["model"]),
                                                             "ref": str(v["ref"]), "backend": v["backend"],
-                                                            "threads": v["threads"],
+                                                            "threads": v["threads"], "env": v["env"],
                                                             "sha256": v["sha256"]}
                                                for v in variants},
               "pairs": []}
@@ -126,19 +152,29 @@ def main():
             if states.get(v["backend"]) != "available":
                 raise ValueError(f"后端不可用: {v['backend']}（变体 {v['label']}）")
             text = command([v["binary"], "verify", v["model"], v["ref"], "--backend", v["backend"], "--threads",
-                            str(v["threads"]), "--mode", "chained", "--brief"])
+                            str(v["threads"]), "--mode", "chained", "--brief"], v["env"])
             counts = re.search(r"EXACT (\d+) OK (\d+) FAIL (\d+) REF (\d+)", text)
             if not counts or int(counts[3]) or int(counts[4]) or int(counts[1]) + int(counts[2]) == 0:
                 raise ValueError(f"{v['label']} 验证未全部实际执行并通过:\n{text}")
             report["verification"][v["label"]] = text
 
         def sample(v):
-            text = command([v["binary"], "run", v["model"], image, "--backend", v["backend"],
-                            "--threads", str(v["threads"])])
-            match = re.search(r"整图一次\s+([0-9.]+)\s+ms", text)
-            if not match or float(match[1]) <= 0:
+            argv = [v["binary"], "run", v["model"], image, "--backend", v["backend"], "--threads", str(v["threads"])]
+            if args.repeat > 1:
+                argv += ["--repeat", str(args.repeat)]
+            text = command(argv, v["env"])
+            cold = re.search(r"整图一次\s+([0-9.]+)\s+ms", text)
+            if not cold or float(cold[1]) <= 0:
                 raise ValueError(f"无法提取 C++ 计时:\n{text}")
-            return {"label": v["label"], "milliseconds": float(match[1]), "stdout": text}
+            record = {"label": v["label"], "cold_ms": float(cold[1]), "stdout": text}
+            if args.repeat > 1:
+                warm = re.search(r"热身后 \d+ 次中位数\s+([0-9.]+)\s+ms", text)
+                if not warm or float(warm[1]) <= 0:
+                    raise ValueError(f"无法提取热身后计时:\n{text}")
+                record["milliseconds"] = float(warm[1])
+            else:
+                record["milliseconds"] = float(cold[1])
+            return record
 
         pairs = [(baseline, v) for v in variants[1:]]
         for base, cand in pairs:

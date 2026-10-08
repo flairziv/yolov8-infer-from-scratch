@@ -15,7 +15,12 @@ struct Tensor {
     bool is_const = false;          // 常量（权重、偏置）还是激活
     int64_t const_offset = -1;      // 常量在 weights.bin 里的字节偏移
     float* data = nullptr;          // 常量：指向模型的权重缓冲；激活：由执行器分配内存后填入
+    // 零拷贝视图：本张量是 view_of 那个张量的一段连续切片（Split 在 batch=1 时成立）。
+    // 视图不占 arena，data 指向父张量缓冲 + view_offset；生命周期由父张量覆盖。
+    int view_of = -1;
+    int64_t view_offset = -1;       // 相对父张量起始的字节偏移
 
+    bool is_view() const { return view_of >= 0; }
     int64_t numel() const;
     size_t bytes() const { return static_cast<size_t>(numel()) * sizeof(float); }
     std::string shape_str() const;  // 例如 "1x16x320x320"

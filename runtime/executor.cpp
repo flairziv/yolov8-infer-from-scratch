@@ -13,12 +13,20 @@ Executor::Executor(Model& model, bool reuse, Backend backend, int threads)
     require_backend(backend_);
     YI_CHECK(threads_ >= 1, "线程数至少是 1");
     if (threads_ > 1) pool_ = std::make_unique<ThreadPool>(threads_);
+    mark_split_views(model_);   // batch=1 的 Split 输出做成零拷贝视图，规划与执行都按视图处理
     const MemoryPlan plan = reuse ? plan_reuse(model_) : plan_naive(model_);
     arena_ = AlignedBuffer(plan.total);
+    // 先给普通激活分配地址，再让视图指进父张量的切片（视图的父张量一定不是视图）。
     for (size_t i = 0; i < model_.tensors.size(); ++i) {
         Tensor& t = model_.tensors[i];
-        if (!t.is_const) t.data = reinterpret_cast<float*>(arena_.as<char>() + plan.offset[i]);
+        if (!t.is_const && !t.is_view()) t.data = reinterpret_cast<float*>(arena_.as<char>() + plan.offset[i]);
     }
+    for (Tensor& t : model_.tensors)
+        if (t.is_view())
+            t.data = reinterpret_cast<float*>(reinterpret_cast<char*>(model_.tensors[t.view_of].data) + t.view_offset);
+    for (const Tensor& t : model_.tensors)
+        if (t.is_view()) ++view_tensors_;
+    in_place_tensors_ = plan.in_place.size();
     size_t workspace_bytes = 0;
     for (const Node& n : model_.nodes) {
         const auto selected = select_kernel(n, model_.tensors, backend_);

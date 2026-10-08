@@ -24,6 +24,8 @@ public:
     int threads() const { return threads_; }
     size_t simd_nodes() const { return simd_nodes_; }
     size_t fallback_nodes() const { return fallback_nodes_; }
+    size_t view_tensors() const { return view_tensors_; }      // 零拷贝视图张量个数
+    size_t in_place_tensors() const { return in_place_tensors_; }  // 原地覆盖的输出个数
     void set_input(size_t k, const float* data);
     void run();
     void run_node(size_t i); // 复用模式下按拓扑序执行；中间值过期后可以被覆盖
@@ -41,6 +43,8 @@ private:
     std::vector<KernelFn> kernels_;
     size_t simd_nodes_ = 0;
     size_t fallback_nodes_ = 0;
+    size_t view_tensors_ = 0;
+    size_t in_place_tensors_ = 0;
 };
 
 }  // namespace yi

@@ -46,9 +46,16 @@ void concat(const Node& node, std::vector<Tensor>& t, Workspace&) {
     YI_CHECK(pos == y_block, "Concat 各输入沿拼接轴的长度之和不等于输出");
 }
 
-// Split：Concat 反过来，从输入的每个块里依次切出各输出的那一段
+// Split：Concat 反过来，从输入的每个块里依次切出各输出的那一段。
+// 输出被标记为零拷贝视图时（batch=1，执行器已把 data 指进父张量的切片）不需要拷贝任何数据。
 void split(const Node& node, std::vector<Tensor>& t, Workspace&) {
     const Tensor& x = t[node.inputs[0]];
+    if (t[node.outputs[0]].is_view()) {
+        for (int o : node.outputs)
+            YI_CHECK(t[o].is_view() && t[o].view_of == t[node.outputs[0]].view_of,
+                     "Split 的输出要么全是同一个父张量的视图，要么全不是");
+        return;
+    }
     const int64_t axis = node.attrs.i("axis");
     const auto sizes = node.attrs.ints("sizes");
     YI_CHECK(sizes.size() == node.outputs.size(), "Split 的 sizes 个数和输出个数不一致");

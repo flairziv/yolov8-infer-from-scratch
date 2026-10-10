@@ -2,7 +2,7 @@
 
 从零手写 YOLOv8 推理引擎的学习项目：Python 图优化前端 + 不依赖推理库的 C++ 运行时，使用 ONNX Runtime 的参考输出做逐层验证。
 
-**当前完成阶段 4**：CPU 侧完成卷积形状特化、Conv+SiLU 收尾融合、多线程（任意线程数输出与单线程逐位一致）、第二次内存优化（arena 18.75 → 10.94 MiB）与检测后处理（与 Ultralytics 同几何逐框 IoU ≥ 0.9998）；CUDA 后端把激活与权重放进显存，朴素直接卷积 → 共享内存分块 2.43×，热身后比 AVX2 4 线程快 2.94×（RTX 4060 Laptop，同机交错对照）。
+**当前完成阶段 5**：CPU 侧完成卷积形状特化、Conv+SiLU 收尾融合、多线程（任意线程数输出与单线程逐位一致）、第二次内存优化（arena 18.75 → 10.94 MiB）与检测后处理（与 Ultralytics 同几何逐框 IoU ≥ 0.9998）；CUDA 后端朴素直接卷积 → 共享内存分块 2.43×，热身后比 AVX2 4 线程快 2.94×；模型可按张量切成多段串联执行（每段可不同后端），串联输出与整体模型逐位相同。
 
 ## 进度
 
@@ -12,8 +12,8 @@
 | 1 | 七个算子的标量实现，整图对齐 ORT；按生命周期复用激活内存 | 完成 |
 | 2 | SSE/AVX2 逐元素算子、池化、SiLU、卷积微内核与工作区复用 | 完成 |
 | 3 | 卷积形状特化、Conv+SiLU 收尾融合、多线程、第二次内存优化、检测后处理 | 完成 |
-| 4 | CUDA 后端：显存 arena、七种算子、直接卷积的共享内存与寄存器分块 | **完成** |
-| 5 | 可选：INT8 卷积 / ARM NEON 移植 / 算子切分与串联部署 | 待定 |
+| 4 | CUDA 后端：显存 arena、七种算子、直接卷积的共享内存与寄存器分块 | 完成 |
+| 5 | 算子切分与串联部署：按张量切段、共享权重、逐段执行、每段可选后端 | **完成**（INT8 / ARM NEON 未做） |
 
 ## 整体结构
 
@@ -28,7 +28,7 @@ Python 前端 frontend/（离线跑一次）
 C++ 运行时 runtime/（不依赖推理库）
   Model::load 解析模型、权重整块读入 → 内存规划（生命周期复用、Split 视图、原地覆盖）→ Executor 按拓扑序逐个调用算子
   后端：scalar / sse / avx2（可多线程）/ cuda（激活与权重在显存，主机影子回读）
-  tools/yinfer：info（模型概况）/ run（整图执行）/ verify（逐层对拍）/ detect（DFL + NMS，输出检测框）
+  tools/yinfer：info（模型概况）/ run（整图执行）/ verify（逐层对拍）/ detect（DFL + NMS，输出检测框）/ chain（多段串联）
 ```
 
 前端导出的目标子图位于检测头 DFL 解码之前：95 个节点、7 种算子，输出 3 个尺度各一个框分支（64 通道）和类别分支（80 通道）。57 个卷积带 `act=1`，SiLU 收尾已融进卷积。DFL 解码、sigmoid、坐标变换和 NMS 在 C++ 后处理里实现（`tools/postprocess.cpp` + `yinfer detect`，见阶段 3.5）；这种拆分思路也常用于 NPU 部署，但具体支持范围取决于工具链和版本。
@@ -128,6 +128,39 @@ node Conv /model.0/conv/Conv in=images,model.0.conv.weight_bnfold,/model.0/conv/
 - 未实现算子会标记 REF 并使用参考输出，**不能据此宣称整网通过**；误差传播也会被 REF 节点截断。
 - 有 FAIL 时退出码为 1；没有 FAIL 时为 0，即使仍有 REF。独立执行遇到未实现算子时返回 2。
 - 当前七种算子已实现，两张测试图片的结果均不含 REF。
+
+### 阶段 5：算子切分与串联部署
+
+部署里常见的切法是"主干放加速器、颈部和头放 CPU"，或者把一个大模型切成几段分别跑。这一阶段做的是"切"和"串"两件事，不改任何节点、权重和执行顺序：
+
+- **`frontend/split_model.py`**：把编译好的模型按 `--at 张量名`（在产生该张量的节点之后切一刀，可重复）或 `--parts N`（按节点数均分）切成多段。每段都是完整合法的 `model.txt`（自己的 input/output/tensor 声明，节点行原样写回），**共享同一份 `weights.bin`**（相对路径引用，常量偏移不变、不复制权重；`--copy-weights` 可选复制）。边界张量由工具推出：在本段产生、被后面的段消费或本身是图输出的激活。最后写出 `chain.txt` 清单（段目录、每段输入/输出、原图输出顺序）。
+- **`yinfer chain <chain.txt> <input.bin> [--backend b 或 b1,b2,...] [--threads] [--repeat] [--dump-dir]`**：逐段加载、各建一个执行器（**每段可指定不同后端**），段间按名字把上游段的边界张量回读后写进下游段的输入；最终输出按原图顺序打印/dump，与 `run --dump-dir` 可直接比较。
+- **真实模型的切法**：在 SPPF 输出 `/model.9/cv2/act/Mul_output_0` 后切 → part0 主干 45 节点、part1 颈部+头 50 节点，边界正好是 P3/P4/P5 三张特征图（1×64×80×80、1×128×40×40、1×256×20×20，共 4.4 MiB）；`--parts 3` 均分则有 5 个边界张量。
+- `scripts/compare_dumps.py` 比较两个 dump 目录（逐位 / 容差两种口径）。
+
+验证：
+
+| 对照 | 结果 |
+|---|---|
+| 2 段串联（avx2×4）vs 整体 `run` | 六路输出**逐位相同** |
+| 3 段串联（avx2×4）vs 整体 `run` | 逐位相同 |
+| 异构串联（part0=cuda，part1=avx2）vs 整体 avx2 | 最大 rel 2.55e-6 |
+| 同上 vs 整体 cuda | 最大 rel 9.4e-7 |
+| `tests/test_split_chain.py` | 合成模型 `--at` / `--parts` / `--copy-weights` 三种切法串联逐位一致（含"一个张量既是边界又在本段内继续使用"的情形）；非法切点、切在最后一个节点后、非空输出目录、后端个数不匹配、清单缺失都被拒绝 |
+| 测试矩阵 | 62 个 Python 测试在 CPU 与 CUDA 二进制下通过，4 个 CTest 目标在两种构建下通过 |
+
+串联开销（单进程 `--repeat 10` 热身后中位数，**观测值，不是交错协议**）：整体 avx2×4 49.4 ms vs 2 段 43.3 ms / 3 段 43.7 ms（噪声范围内，边界只是 4.4 MiB 的 memcpy）；整体 cuda 17.0 ms vs 2 段 cuda,cuda 18.0 ms（约 +1 ms，边界张量 D2H+H2D）；异构 cuda,avx2 30.9 ms = part0 cuda 6.7 + part1 avx2 25.9——比全 CUDA 慢，因为颈部+头本来就是 CPU 上的大头。这个例子证明的是**机制**（跨后端切分并逐位/容差可验），不是加速；真实的异构部署会只把加速器不支持的尾巴放 CPU。
+
+边界：只支持顺序串联（没有流水并行与重叠）；切点必须落在节点边界；只支持第一段单输入；没有做 INT8 与 ARM NEON（阶段 5 的另两个可选项）。
+
+```bash
+python3 frontend/split_model.py --model artifacts/model --out artifacts/model-parts2 --at /model.9/cv2/act/Mul_output_0
+./build/yinfer run artifacts/model artifacts/ref/input.bin --backend avx2 --threads 4 --dump-dir artifacts/chain-ref-avx2
+./build/yinfer chain artifacts/model-parts2/chain.txt artifacts/ref/input.bin --backend avx2 --threads 4 --dump-dir artifacts/chain-2-avx2
+python3 scripts/compare_dumps.py artifacts/chain-ref-avx2 artifacts/chain-2-avx2      # 全部逐位相同
+./build-cuda/yinfer chain artifacts/model-parts2/chain.txt artifacts/ref/input.bin --backend cuda,avx2 --threads 4 --repeat 10
+python3 tests/test_split_chain.py
+```
 
 ### 阶段 4：CUDA 后端
 
@@ -496,11 +529,11 @@ ctest --test-dir build-asan --output-on-failure
 ## 目录
 
 ```
-frontend/   Python 前端：导出、图优化、编译成运行时格式、生成参考数据
+frontend/   Python 前端：导出、图优化、编译成运行时格式、生成参考数据、按张量切分模型（split_model.py）
 runtime/    C++ 运行时：模型加载、内存规划、线程池、执行器、标量与 SSE/AVX2 算子；cuda/ 为 CUDA 后端（含无 CUDA 时的 stub）
 tools/      命令行工具 yinfer、参考数据读取、检测后处理（DFL/NMS）
-tests/      小型 ONNX 算子对拍、验证器回归、多线程/内存/后处理/CUDA 的 C++ 与 Python 测试
-scripts/    prepare.sh（Python 前端）、build.sh / build_cuda.sh（CMake 编译）、benchmark_backends.py（同机交错基准）、detect.py（画框与对照）
+tests/      小型 ONNX 算子对拍、验证器回归、多线程/内存/后处理/CUDA/切分串联的 C++ 与 Python 测试
+scripts/    prepare.sh（Python 前端）、build.sh / build_cuda.sh（CMake 编译）、benchmark_backends.py（同机交错基准）、detect.py（画框与对照）、compare_dumps.py（dump 对比）
 artifacts/  权重、ONNX、模型文件、参考数据、基准报告和本地验证日志，不进版本库
 ```
 

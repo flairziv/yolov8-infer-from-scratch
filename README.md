@@ -15,6 +15,43 @@
 | 4 | CUDA 后端：显存 arena、七种算子、直接卷积的共享内存与寄存器分块 | 完成 |
 | 5 | 算子切分与串联部署：按张量切段、共享权重、逐段执行、每段可选后端 | **完成**（INT8 / ARM NEON 未做） |
 
+## 一页总览
+
+每一项优化都配一个**证据口径**：逐位一致（`memcmp`）、容差一致（逐层对拍 `rel ≤ 1e-4`）、同机交错计时（ABBA/BAAB、fresh process）。口径不同的数字不能相互折算；详情见各阶段小节。
+
+| 阶段 | 做了什么 | 证据口径 | 结果 |
+|---|---|---|---|
+| 0 | ONNX 图优化前端 + 文本模型格式 + C++ 执行骨架 + 逐层对拍工具 | 故意注入错误能被抓到 | 验证器自身可验 |
+| 1 | 七种算子标量实现，整图对齐 ORT | 两张图逐层对拍 | 160 个张量 FAIL=0，最大 rel 8.9e-6 |
+| 1.4 | 按生命周期复用激活内存 | naive/reuse 输出 memcmp | arena 158.81 → 17.19 MiB |
+| 2 | SSE/AVX2 微内核（MR=4，NR=8/16）、im2col 面板、工作区复用 | 同机交错 | scalar → sse 14.9×，→ avx2 31.4× |
+| 3.1 | 1×1 卷积直通（跳过 im2col） | 同机交错 | 1.50× |
+| 3.2 | Conv+SiLU 收尾融合（格式 v2，旧运行时拒绝） | 融合前后 memcmp + 交错 | 152 → 95 节点；本机测不出速度差异 |
+| 3.3 | 线程池 + 按输出划分的数据并行 | 任意线程数 memcmp + TSan + 交错 | 1→4 线程 avx2 2.18×、sse 2.90× |
+| 3.4 | Split 零拷贝视图、输入解钉、Add/SiLU 原地覆盖 | 新旧二进制 memcmp | arena 18.75 → 10.94 MiB（= 独立算出的峰值下界） |
+| 3.5 | DFL 解码 + 类内 NMS + letterbox 反算 | 与 Ultralytics **同几何**逐框对照 | bus 5/5、zidane 3/3，IoU ≥ 0.9998 |
+| 4 | CUDA 后端：显存 arena、七种算子、直接卷积共享内存分块 | 容差对拍 + 两版 memcmp + 交错（热身后） | 朴素 → 分块 2.43×；比 avx2×4 快 2.94× |
+| 5 | 按张量切段共享权重、逐段串联、每段可选后端 | 串联 vs 整体 memcmp | 2/3 段逐位相同；cuda+avx2 异构 rel 2.55e-6 |
+
+测试矩阵：62 个 Python 测试 + 4 个 CTest 目标，在 Release、ASan/UBSan、CUDA 三种构建下通过；多线程路径另做 TSan（本机内核需重试启动，未改系统 ASLR）。所有基准报告（JSON + SHA256）与大产物留在 `artifacts/`，不进版本库。
+
+从零复现（WSL/Linux，需自备 `yolov8n.pt`）：
+
+```bash
+mkdir -p artifacts && cp /path/to/yolov8n.pt artifacts/      # 权重不随仓库分发
+PYTHON=python3 bash scripts/prepare.sh                         # 导出 → 图优化 → 模型文件 → ORT 参考数据
+bash scripts/build.sh && ctest --test-dir build --output-on-failure
+python3 -m unittest discover -s tests                         # 62 个测试
+./build/yinfer verify artifacts/model artifacts/ref --backend avx2 --mode chained --threads 4
+./build/yinfer detect artifacts/model artifacts/ref/input.bin --backend avx2 --threads 4   # 输出检测框
+python3 scripts/detect.py --ref artifacts/ref --out artifacts/detect-bus.jpg                 # 画框 + 与官方对照
+bash scripts/build_cuda.sh && ./build-cuda/yinfer run artifacts/model artifacts/ref/input.bin --backend cuda --repeat 10
+python3 frontend/split_model.py --model artifacts/model --out artifacts/model-parts2 --at /model.9/cv2/act/Mul_output_0
+./build-cuda/yinfer chain artifacts/model-parts2/chain.txt artifacts/ref/input.bin --backend cuda,avx2 --threads 4
+```
+
+结论边界（整个仓库适用）：所有性能数字都是**本机**（i9-14900HX 的 WSL2、4 vCPU；RTX 4060 Laptop）同机交错对照，不外推到其它设备；不同阶段的数字不相除；"测不出差异"就写测不出；数值一致只说明这两张测试图的张量与 ORT/官方实现一致，不是 mAP 评测。
+
 ## 整体结构
 
 ```

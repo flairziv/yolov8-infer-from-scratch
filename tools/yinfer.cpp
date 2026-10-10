@@ -3,6 +3,8 @@
 //   yinfer run    <模型目录> <input.bin>              整图执行一遍；有算子没实现会列出来
 //   yinfer verify <模型目录> <参考数据目录> [选项]      逐层和 ORT 对拍
 //   yinfer detect <模型目录> <input.bin> [选项]        DFL 解码 + 类内 NMS，输出检测框
+//   yinfer chain  <chain.txt> <input.bin> [选项]       多段串联执行（split_model.py 切出来的段）
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -30,6 +34,7 @@ void usage() {
         "  yinfer run    <模型目录> <input.bin> [--backend scalar|sse|avx2|cuda] [--memory naive|reuse] [--threads N] [--repeat N] [--dump-dir 目录]\n"
         "  yinfer verify <模型目录> <参考数据目录> [--backend scalar|sse|avx2|cuda] [--mode isolated|chained] [--tol 1e-4] [--threads N] [--perturb 节点号] [--brief]\n"
         "  yinfer detect <模型目录> <input.bin> [--conf 0.25] [--iou 0.7] [--backend scalar|sse|avx2|cuda] [--threads N] [--letterbox 缩放,左右填充,上下填充] [--out 文件]\n"
+        "  yinfer chain  <chain.txt> <input.bin> [--backend b 或 b1,b2,...（每段一个）] [--memory naive|reuse] [--threads N] [--repeat N] [--dump-dir 目录]\n"
         "\n"
         "verify 的两种模式:\n"
         "  isolated  每个节点都从参考数据取输入，只量这一层自己引入的误差（默认）\n"
@@ -332,6 +337,148 @@ int cmd_detect(const std::string& model_dir, const std::string& input_path, cons
     return 0;
 }
 
+struct ChainOptions {
+    std::vector<Backend> backends;   // 一个：所有段相同；多个：每段一个
+    int threads = 1;
+    bool reuse = true;
+    int repeat = 1;
+    std::string dump_dir;
+};
+
+// chain.txt：part <目录> ...（相对清单所在目录）；output <名字>（原图输出顺序）；其余行忽略。
+struct ChainManifest {
+    std::vector<std::string> parts;
+    std::vector<std::string> outputs;
+};
+
+ChainManifest read_manifest(const std::string& path) {
+    std::ifstream f(path);
+    YI_CHECK(f, "打不开清单 " << path);
+    ChainManifest m;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        std::string key, value;
+        if (!(ss >> key) || key[0] == '#') continue;
+        if (key == "part") {
+            YI_CHECK(ss >> value, "清单的 part 行缺少目录");
+            m.parts.push_back(value);
+        } else if (key == "output") {
+            YI_CHECK(ss >> value, "清单的 output 行缺少名字");
+            m.outputs.push_back(value);
+        }
+    }
+    YI_CHECK(!m.parts.empty() && !m.outputs.empty(), "清单里没有 part 或 output 行");
+    return m;
+}
+
+// 多段串联：每段一个模型、一个执行器；段间边界张量按名字从上游段回读、写入下游段的输入。
+// 各段内部执行顺序与整体模型相同，所以同后端下串联输出应与整体模型逐位一致。
+int cmd_chain(const std::string& manifest_path, const std::string& input_path, const ChainOptions& opt) {
+    const ChainManifest manifest = read_manifest(manifest_path);
+    const std::filesystem::path base = std::filesystem::path(manifest_path).parent_path();
+    YI_CHECK(opt.backends.size() == 1 || opt.backends.size() == manifest.parts.size(),
+             "--backend 要么只给一个（各段相同），要么给每段一个，收到 " << opt.backends.size() << " 个、清单有 "
+                                                                        << manifest.parts.size() << " 段");
+    struct Part {
+        Model model;
+        std::unique_ptr<Executor> ex;
+        Backend backend = Backend::Scalar;
+    };
+    std::vector<std::unique_ptr<Part>> parts;   // 堆上放置：执行器持有 Model 的引用，不能搬动
+    std::map<std::string, std::pair<size_t, int>> produced;   // 名字 → (段号, 张量下标)
+    for (size_t i = 0; i < manifest.parts.size(); ++i) {
+        auto part = std::make_unique<Part>();
+        part->backend = opt.backends.size() == 1 ? opt.backends[0] : opt.backends[i];
+        part->model = Model::load((base / manifest.parts[i]).string());
+        part->ex = std::make_unique<Executor>(part->model, opt.reuse, part->backend, opt.threads);
+        YI_CHECK(part->ex->missing_kernels().empty(), "段 " << i << " 有未实现的算子");
+        for (size_t k = 0; k < part->model.inputs.size(); ++k) {
+            const Tensor& t = part->model.tensors[part->model.inputs[k]];
+            if (i == 0) {
+                YI_CHECK(part->model.inputs.size() == 1, "第一段应只有一个图输入");
+            } else {
+                const auto it = produced.find(t.name);
+                YI_CHECK(it != produced.end(), "段 " << i << " 的输入 " << t.name << " 没有更早的段产生它");
+                const Tensor& src = parts[it->second.first]->model.tensors[it->second.second];
+                YI_CHECK(src.shape == t.shape, "边界张量 " << t.name << " 两端形状不一致");
+            }
+        }
+        for (int o : part->model.outputs) produced[part->model.tensors[o].name] = {i, o};
+        std::printf("part%zu: %s 节点 %zu 个 backend=%s arena=%.2f MiB\n", i, manifest.parts[i].c_str(),
+                    part->model.nodes.size(), backend_name(part->backend), mib(part->ex->arena_bytes()));
+        parts.push_back(std::move(part));
+    }
+    for (const auto& name : manifest.outputs)
+        YI_CHECK(produced.count(name), "清单里的输出 " << name << " 没有任何段产生");
+
+    const Tensor& in = parts[0]->model.tensors[parts[0]->model.inputs[0]];
+    const AlignedBuffer x = read_file(input_path, static_cast<int64_t>(in.bytes()));
+    std::vector<double> totals;
+    std::vector<double> per_part(parts.size(), 0.0);
+    for (int r = 0; r < opt.repeat; ++r) {
+        double total = 0.0;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            Part& part = *parts[i];
+            const auto t0 = std::chrono::steady_clock::now();
+            if (i == 0) {
+                part.ex->set_input(0, x.as<float>());
+            } else {
+                for (size_t k = 0; k < part.model.inputs.size(); ++k) {
+                    const auto& src = produced.at(part.model.tensors[part.model.inputs[k]].name);
+                    part.ex->set_input(k, parts[src.first]->ex->host_ptr(static_cast<size_t>(src.second)));
+                }
+            }
+            part.ex->run();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            per_part[i] = ms;
+            total += ms;
+        }
+        totals.push_back(total);
+    }
+    for (size_t i = 0; i < parts.size(); ++i)
+        std::printf("  part%zu %s %.6f ms（最后一次，含边界搬运）\n", i, backend_name(parts[i]->backend), per_part[i]);
+    for (const auto& name : manifest.outputs) {
+        const auto& src = produced.at(name);
+        const Tensor& t = parts[src.first]->model.tensors[src.second];
+        const float* data = parts[src.first]->ex->host_ptr(static_cast<size_t>(src.second));
+        double lo = INFINITY, hi = -INFINITY, sum = 0;
+        for (int64_t k = 0; k < t.numel(); ++k) {
+            lo = std::fmin(lo, data[k]);
+            hi = std::fmax(hi, data[k]);
+            sum += data[k];
+        }
+        std::printf("  %-14s min %9.4f  max %9.4f  mean %9.4f  %s\n", t.shape_str().c_str(), lo, hi, sum / t.numel(), t.name.c_str());
+    }
+    std::printf("串联一次 %.6f ms（单次，含冷启动与边界搬运）\n", totals[0]);
+    if (opt.repeat > 1) {
+        std::vector<double> warm(totals.begin() + 1, totals.end());
+        std::sort(warm.begin(), warm.end());
+        const double median = warm.size() % 2 ? warm[warm.size() / 2]
+                                              : 0.5 * (warm[warm.size() / 2 - 1] + warm[warm.size() / 2]);
+        std::printf("热身后 %zu 次中位数 %.6f ms（最小 %.6f ms）\n", warm.size(), median, warm.front());
+    }
+    if (!opt.dump_dir.empty()) {
+        std::filesystem::create_directories(opt.dump_dir);
+        std::ofstream index(std::filesystem::path(opt.dump_dir) / "outputs.txt");
+        YI_CHECK(index, "无法创建输出索引 " << opt.dump_dir);
+        for (size_t i = 0; i < manifest.outputs.size(); ++i) {
+            const auto& src = produced.at(manifest.outputs[i]);
+            const Tensor& t = parts[src.first]->model.tensors[src.second];
+            const float* data = parts[src.first]->ex->host_ptr(static_cast<size_t>(src.second));
+            const std::string file = "output" + std::to_string(i) + ".bin";
+            std::ofstream out(std::filesystem::path(opt.dump_dir) / file, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(t.bytes()));
+            YI_CHECK(out, "输出文件写入失败 " << file);
+            index << file << " " << t.name << " ";
+            for (size_t d = 0; d < t.shape.size(); ++d) index << (d ? "," : "") << t.shape[d];
+            index << "\n";
+        }
+        YI_CHECK(index, "输出索引写入失败");
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {    try {
@@ -446,6 +593,33 @@ int main(int argc, char** argv) {    try {
                 }
             }
             return cmd_detect(argv[2], argv[3], opt);
+        }
+        if (cmd == "chain" && argc >= 4) {
+            ChainOptions opt;
+            opt.backends = {Backend::Scalar};
+            for (int i = 4; i < argc; ++i) {
+                const std::string a = argv[i];
+                YI_CHECK(i + 1 < argc, a << " 后面缺参数");
+                const std::string v = argv[++i];
+                if (a == "--backend") {
+                    opt.backends.clear();
+                    for (const auto& name : split_commas(v)) opt.backends.push_back(parse_backend(name));
+                } else if (a == "--threads") {
+                    opt.threads = parse_threads(v);
+                } else if (a == "--repeat") {
+                    opt.repeat = parse_threads(v);
+                    YI_CHECK(opt.repeat <= 10000, "--repeat 最多 10000");
+                } else if (a == "--memory") {
+                    YI_CHECK(v == "naive" || v == "reuse", "--memory 只能是 naive 或 reuse");
+                    opt.reuse = v == "reuse";
+                } else if (a == "--dump-dir") {
+                    opt.dump_dir = v;
+                } else {
+                    usage();
+                    return 1;
+                }
+            }
+            return cmd_chain(argv[2], argv[3], opt);
         }
         usage();
         return 1;
